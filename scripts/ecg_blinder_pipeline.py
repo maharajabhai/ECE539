@@ -1,0 +1,978 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ECG Privacy + Blinder-style Anonymization Pipeline on PTB-XL
+
+Directory assumptions (match your ECE539 tree):
+- Project root: /Users/bluitel/Documents/ECE539/ECE539
+- PTB-XL DB:    <PROJECT_ROOT>/data/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1
+- Benchmark repo: <PROJECT_ROOT>/ecg_ptbxl_benchmarking
+- This script:  <PROJECT_ROOT>/scripts/ecg_privacy_blinder_pipeline.py
+
+What this script does:
+
+1) Load PTB-XL via pipeline.datasets.ecg_ptbxl.load_ptbxl_and_eda.
+2) Build multi-hot utility labels from diagnostic_superclass.
+3) Load / evaluate a fastai utility model (xresnet1d101).
+4) Build a patient-aware identity split (train/val share the same patients).
+5) Train (or load) a multi-task identity classifier over:
+   - patient_id
+   - sex
+   - age_bin
+   - height_bin
+   - weight_bin
+6) Baseline evaluation on VALIDATION SET:
+   - Identity metrics (patient / sex / age / height / weight).
+   - Utility metrics (sample-wise accuracy, F1, MAE).
+   - Fidelity (upper bound): RMSE + PSD correlation with "anonymized = original".
+   - Interpretability: FFT + t-SNE.
+
+7) Train a simple Blinder-style VAE autoencoder on standardized ECG
+   (Encoder + Decoder imported from Blinder code style).
+   NOTE: this is a reconstruction VAE, not yet a full privacy model.
+8) Run anonymization on the full standardized PTB-XL set.
+9) Evaluate identity + utility on anonymized ECG.
+10) Compute fidelity, FFT, and t-SNE AFTER anonymization.
+11) Dump all metrics (baseline vs anonymized) + plot paths to a JSON file.
+"""
+
+import os
+import pickle
+import sys
+import json
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+
+from scipy import signal
+import matplotlib.pyplot as plt
+
+# -------------------------------------------------------------------
+# Path setup
+# -------------------------------------------------------------------
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+
+PTBXL_BENCH_CODE = os.path.join(PROJECT_ROOT, "ecg_ptbxl_benchmarking", "code")
+for p in [PROJECT_ROOT, PTBXL_BENCH_CODE]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+# ecg_ptbxl_benchmarking imports
+from utils import utils
+from models.fastai_model import fastai_model
+
+# your own loader
+from pipeline.datasets import ecg_ptbxl
+
+
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
+
+@dataclass
+class Config:
+    datafolder: str = os.path.join(
+        PROJECT_ROOT,
+        "data",
+        "ptb-xl-a-large-publicly-available-electrocardiography-dataset-1",
+    )
+
+    outputfolder: str = os.path.join(
+        PROJECT_ROOT,
+        "ecg_ptbxl_benchmarking",
+        "output",
+    )
+
+    experiment: str = "exp0"
+    modelname: str = "fastai_xresnet1d101"
+    n_classes_pretrained: int = 71
+
+    sampling_frequency: int = 100  # Hz from your loader
+
+    # identity classifier
+    identity_batch_size: int = 64
+    identity_lr: float = 1e-3
+    identity_epochs: int = 60
+    min_samples_per_patient: int = 5
+    identity_val_fraction: float = 0.2  # per-patient val fraction
+
+    # VAE / Blinder-style autoencoder
+    use_blinder: bool = True
+    blinder_z_dim: int = 64
+    blinder_epochs: int = 10
+    blinder_batch_size: int = 128
+    blinder_lr: float = 1e-3
+
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    identity_ckpt: str = os.path.join(PROJECT_ROOT, "scripts", "identity_best.pt")
+    blinder_ckpt: str = os.path.join(PROJECT_ROOT, "scripts", "blinder_vae.pt")
+
+    results_dir: str = os.path.join(PROJECT_ROOT, "privacy_baseline_outputs")
+
+    seed: int = 1234
+
+
+cfg = Config()
+os.makedirs(cfg.results_dir, exist_ok=True)
+
+np.random.seed(cfg.seed)
+torch.manual_seed(cfg.seed)
+if cfg.device == "cuda":
+    torch.cuda.manual_seed_all(cfg.seed)
+
+
+# -------------------------------------------------------------------
+# Utility label builder
+# -------------------------------------------------------------------
+
+def build_utility_labels_from_superclass(Y: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    all_super = []
+    for lst in Y["diagnostic_superclass"].values:
+        all_super.extend(lst)
+    super_classes = sorted(list(set(all_super)))
+    col2idx = {c: i for i, c in enumerate(super_classes)}
+
+    N = len(Y)
+    K = len(super_classes)
+    y_util = np.zeros((N, K), dtype=np.float32)
+    for i, lst in enumerate(Y["diagnostic_superclass"].values):
+        for c in lst:
+            y_util[i, col2idx[c]] = 1.0
+
+    return y_util, super_classes
+
+
+# -------------------------------------------------------------------
+# Identity meta with per-patient train/val split
+# -------------------------------------------------------------------
+
+def bin_numeric(col: pd.Series, bins: List[int]) -> pd.Series:
+    labels = list(range(len(bins) - 1))
+    return pd.cut(col, bins=bins, labels=labels, include_lowest=True).astype(int)
+
+
+def build_identity_meta(Y: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Build metadata for identity classification:
+    - filter to patients with >= min_samples_per_patient
+    - create patient index + binned age/height/weight + sex_bin
+    - create a *per-patient* train/val split 'id_fold':
+        - Every patient appears in both train and val (if they have >=2 samples)
+        - So patient_id is learnable on validation set.
+    """
+    meta = Y.copy().reset_index(drop=False)  # 'index' is ecg_id
+    meta["row_idx"] = np.arange(len(meta))
+
+    counts = meta["patient_id"].value_counts()
+    valid_pids = counts[counts >= cfg.min_samples_per_patient].index
+    meta = meta[meta["patient_id"].isin(valid_pids)].reset_index(drop=True)
+
+    print(f"[Identity] After min_samples filter: {len(meta)} records "
+          f"from {len(valid_pids)} patients")
+
+    unique_pids = sorted(meta["patient_id"].unique())
+    pid2idx = {pid: i for i, pid in enumerate(unique_pids)}
+    meta["patient_idx"] = meta["patient_id"].map(pid2idx)
+
+    # labels
+    meta["sex_bin"] = meta["sex"].fillna(0).astype(int)
+
+    age_bins = [0, 30, 45, 60, 75, 200]
+    meta["age_bin"] = bin_numeric(meta["age"].fillna(meta["age"].median()), age_bins)
+
+    height_bins = [0, 150, 165, 180, 200, 300]
+    meta["height_bin"] = bin_numeric(
+        meta["height"].fillna(meta["height"].median()), height_bins
+    )
+
+    weight_bins = [0, 60, 80, 100, 120, 300]
+    meta["weight_bin"] = bin_numeric(
+        meta["weight"].fillna(meta["weight"].median()), weight_bins
+    )
+
+    # per-patient train/val split (id_fold: 0=train, 1=val)
+    folds = np.zeros(len(meta), dtype=int)
+    for pid in unique_pids:
+        idxs = np.where(meta["patient_id"].values == pid)[0]
+        if len(idxs) == 1:
+            folds[idxs] = 0  # single-sample patient: keep in train
+            continue
+        n_val = max(1, int(np.round(cfg.identity_val_fraction * len(idxs))))
+        val_idx = np.random.choice(idxs, size=n_val, replace=False)
+        folds[val_idx] = 1
+        # the rest stay 0 (train)
+    meta["id_fold"] = folds
+
+    print(
+        f"[Identity] Split: "
+        f"{(meta['id_fold']==0).sum()} train samples, "
+        f"{(meta['id_fold']==1).sum()} val samples."
+    )
+
+    info = {
+        "pid2idx": pid2idx,
+        "idx2pid": {v: k for k, v in pid2idx.items()},
+        "age_bins": age_bins,
+        "height_bins": height_bins,
+        "weight_bins": weight_bins,
+        "n_patients": len(unique_pids),
+        "n_age_bins": len(age_bins) - 1,
+        "n_height_bins": len(height_bins) - 1,
+        "n_weight_bins": len(weight_bins) - 1,
+    }
+    return meta, info
+
+
+# -------------------------------------------------------------------
+# Identity dataset + model
+# -------------------------------------------------------------------
+
+class IdentityDataset(Dataset):
+    def __init__(self,
+                 data_std: np.ndarray,  # (N, T, C)
+                 meta: pd.DataFrame,
+                 split: str):
+        self.split = split
+        if split == "train":
+            subset = meta[meta["id_fold"] == 0]
+        elif split == "val":
+            subset = meta[meta["id_fold"] == 1]
+        else:
+            raise ValueError("split must be 'train' or 'val'")
+
+        self.meta = subset.reset_index(drop=True)
+
+        row_idx = self.meta["row_idx"].values
+        # (N, T, C) -> (N, C, T)
+        self.data = np.transpose(data_std[row_idx], (0, 2, 1)).astype(np.float32)
+
+        self.patient = self.meta["patient_idx"].values.astype(int)
+        self.sex = self.meta["sex_bin"].values.astype(int)
+        self.age = self.meta["age_bin"].values.astype(int)
+        self.height = self.meta["height_bin"].values.astype(int)
+        self.weight = self.meta["weight_bin"].values.astype(int)
+
+    def __len__(self):
+        return len(self.meta)
+
+    def __getitem__(self, idx):
+        x = torch.tensor(self.data[idx], dtype=torch.float32)
+        y = {
+            "patient": torch.tensor(self.patient[idx], dtype=torch.long),
+            "sex": torch.tensor(self.sex[idx], dtype=torch.long),
+            "age": torch.tensor(self.age[idx], dtype=torch.long),
+            "height": torch.tensor(self.height[idx], dtype=torch.long),
+            "weight": torch.tensor(self.weight[idx], dtype=torch.long),
+        }
+        return x, y
+
+
+class IdentityNet(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 n_patients: int,
+                 n_age_bins: int,
+                 n_height_bins: int,
+                 n_weight_bins: int):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv1d(in_channels, 32, 7, 2, 3),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(32, 64, 7, 2, 3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(64, 128, 7, 2, 3),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1),
+        )
+
+        self.head_patient = nn.Linear(128, n_patients)
+        self.head_sex = nn.Linear(128, 2)
+        self.head_age = nn.Linear(128, n_age_bins)
+        self.head_height = nn.Linear(128, n_height_bins)
+        self.head_weight = nn.Linear(128, n_weight_bins)
+
+    def forward(self, x):
+        h = self.features(x).squeeze(-1)
+        return {
+            "patient": self.head_patient(h),
+            "sex": self.head_sex(h),
+            "age": self.head_age(h),
+            "height": self.head_height(h),
+            "weight": self.head_weight(h),
+            "feat": h,
+        }
+
+
+def identity_loss(outputs, targets):
+    ce = nn.CrossEntropyLoss()
+    loss = 0.0
+    for key in ["patient", "sex", "age", "height", "weight"]:
+        loss = loss + ce(outputs[key], targets[key])
+    return loss
+
+
+def train_identity(model: IdentityNet,
+                   train_loader: DataLoader,
+                   val_loader: DataLoader,
+                   cfg: Config):
+    model.to(cfg.device)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.identity_lr)
+    best_val_loss = float("inf")
+
+    for epoch in range(cfg.identity_epochs):
+        model.train()
+        train_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(cfg.device)
+            yb = {k: v.to(cfg.device) for k, v in yb.items()}
+            opt.zero_grad()
+            out = model(xb)
+            loss = identity_loss(out, yb)
+            loss.backward()
+            opt.step()
+            train_loss += loss.item() * xb.size(0)
+        train_loss /= len(train_loader.dataset)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(cfg.device)
+                yb = {k: v.to(cfg.device) for k, v in yb.items()}
+                out = model(xb)
+                loss = identity_loss(out, yb)
+                val_loss += loss.item() * xb.size(0)
+        val_loss /= len(val_loader.dataset)
+
+        print(f"[Identity] Epoch {epoch+1}/{cfg.identity_epochs} "
+              f"train_loss={train_loss:.4f} val_loss={val_loss:.4f}")
+
+        torch.save(model.state_dict(), cfg.identity_ckpt.replace(".pt", "_last.pt"))
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), cfg.identity_ckpt)
+
+    print(f"[Identity] Best val loss: {best_val_loss:.4f}")
+
+
+def eval_identity(model: IdentityNet, loader: DataLoader, cfg: Config) -> Dict[str, float]:
+    model.eval()
+    model.to(cfg.device)
+
+    all_true = {k: [] for k in ["patient", "sex", "age", "height", "weight"]}
+    all_pred = {k: [] for k in ["patient", "sex", "age", "height", "weight"]}
+
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(cfg.device)
+            out = model(xb)
+            for key in all_true.keys():
+                logits = out[key].cpu().numpy()
+                preds = np.argmax(logits, axis=1)
+                all_pred[key].extend(preds.tolist())
+                all_true[key].extend(yb[key].numpy().tolist())
+
+    metrics = {}
+    print("[Identity] Validation metrics:")
+    for key in all_true.keys():
+        acc = accuracy_score(all_true[key], all_pred[key])
+        f1 = f1_score(all_true[key], all_pred[key], average="macro")
+        metrics[f"{key}_acc"] = float(acc)
+        metrics[f"{key}_f1"] = float(f1)
+        print(f"  {key}_acc: {acc:.4f}")
+        print(f"  {key}_f1:  {f1:.4f}")
+    return metrics
+
+
+# -------------------------------------------------------------------
+# Utility model (fastai) + metrics
+# -------------------------------------------------------------------
+
+def train_or_load_utility_model_from_ptbxl(
+    X: np.ndarray,
+    Y_db: pd.DataFrame,
+    y_util: np.ndarray,
+    cfg: Config,
+):
+    """
+    Uses ecg_ptbxl_benchmarking's fastai_model; here we ONLY evaluate it.
+    """
+    print("[Utility] Preparing standardization...")
+    scaler_dir = os.path.join(cfg.outputfolder, cfg.experiment, "data")
+    os.makedirs(scaler_dir, exist_ok=True)
+    standard_scaler_path = os.path.join(scaler_dir, "standard_scaler.pkl")
+
+    if os.path.exists(standard_scaler_path):
+        print(f"[Utility] Loading StandardScaler from {standard_scaler_path}")
+        standard_scaler = pickle.load(open(standard_scaler_path, "rb"))
+    else:
+        print("[Utility] Fitting new StandardScaler on folds 1–9...")
+        train_mask = Y_db["strat_fold"] < 10
+        X_train_flat = X[train_mask].reshape(train_mask.sum(), -1)
+        standard_scaler = StandardScaler()
+        standard_scaler.fit(X_train_flat)
+        utils.save_pickle(standard_scaler_path, standard_scaler)
+        print(f"[Utility] Saved scaler to {standard_scaler_path}")
+
+    X_std = utils.apply_standardizer(X, standard_scaler)
+
+    train_mask = Y_db["strat_fold"] < 10
+    val_mask = Y_db["strat_fold"] == 10
+
+    X_train = X_std[train_mask]
+    y_train = y_util[train_mask]
+    X_val = X_std[val_mask]
+    y_val = y_util[val_mask]
+
+    num_classes = y_train.shape[1]
+    T, C = X_train.shape[1], X_train.shape[2]
+    input_shape = [T, C]
+
+    pretrainedfolder = os.path.join(
+        cfg.outputfolder,
+        cfg.experiment,
+        "models",
+        cfg.modelname,
+    )
+
+    print("[Utility] Building fastai model...")
+    model = fastai_model(
+        cfg.modelname,
+        num_classes,
+        cfg.sampling_frequency,
+        cfg.outputfolder,
+        input_shape=input_shape,
+        pretrainedfolder=pretrainedfolder,
+        n_classes_pretrained=cfg.n_classes_pretrained,
+        pretrained=True,
+        epochs_finetuning=0,  # just use pretrained weights as-is
+    )
+
+    print("[Utility] Evaluating on validation set (fold 10)...")
+    y_val_pred = model.predict(X_val)
+    utils.evaluate_experiment(y_val, y_val_pred)
+
+    probs = y_val_pred
+    y_hat = (probs >= 0.5).astype(np.float32)
+    y_true = y_val.astype(np.float32)
+
+    sample_acc = np.mean(np.all(y_true == y_hat, axis=1))
+    f1 = f1_score(y_true.flatten(), y_hat.flatten(), average="binary")
+    mae = mean_absolute_error(y_true.flatten(), probs.flatten())
+
+    metrics = {
+        "utility_sample_acc": float(sample_acc),
+        "utility_f1": float(f1),
+        "utility_mae": float(mae),
+    }
+    print("[Utility] Validation metrics:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    return model, metrics, X_std, standard_scaler
+
+
+def eval_utility_on_data(model, X_val_std: np.ndarray, y_val: np.ndarray) -> Dict[str, float]:
+    from sklearn.metrics import f1_score, mean_absolute_error
+
+    probs = model.predict(X_val_std)
+    probs = np.nan_to_num(probs, nan=0.0, posinf=5.0, neginf=-5.0)
+    y_hat = (probs >= 0.5).astype(np.float32)
+    y_true = y_val.astype(np.float32)
+
+    sample_acc = np.mean(np.all(y_true == y_hat, axis=1))
+    f1 = f1_score(y_true.flatten(), y_hat.flatten(), average="binary")
+    mae = mean_absolute_error(y_true.flatten(), probs.flatten())
+
+    metrics = {
+        "utility_sample_acc": float(sample_acc),
+        "utility_f1": float(f1),
+        "utility_mae": float(mae),
+    }
+    print("[Utility|Anon] Validation metrics on anonymized data:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
+    return metrics
+
+
+# -------------------------------------------------------------------
+# Fidelity + interpretability helpers
+# -------------------------------------------------------------------
+
+def rmse(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((a - b) ** 2)))
+
+
+def psd_correlation(x: np.ndarray, y: np.ndarray, fs: int) -> float:
+    if x.shape != y.shape:
+        raise ValueError("x and y must have the same shape for PSD correlation.")
+
+    if x.shape[0] < x.shape[1]:
+        x_c = x.T
+        y_c = y.T
+    else:
+        x_c = x
+        y_c = y
+
+    C, _ = x_c.shape
+    psds_x, psds_y = [], []
+    for c in range(C):
+        _, p_x = signal.welch(x_c[c], fs=fs, nperseg=256)
+        _, p_y = signal.welch(y_c[c], fs=fs, nperseg=256)
+        psds_x.append(p_x)
+        psds_y.append(p_y)
+
+    psd_x = np.mean(np.stack(psds_x, axis=0), axis=0)
+    psd_y = np.mean(np.stack(psds_y, axis=0), axis=0)
+
+    x_mean = psd_x - psd_x.mean()
+    y_mean = psd_y - psd_y.mean()
+    denom = np.sqrt((x_mean ** 2).sum()) * np.sqrt((y_mean ** 2).sum())
+    if denom == 0:
+        return 0.0
+    return float((x_mean * y_mean).sum() / denom)
+
+
+def plot_fft(signal_np: np.ndarray, fs: int, title: str, filepath: str):
+    if signal_np.shape[0] < signal_np.shape[1]:
+        data = signal_np.T
+    else:
+        data = signal_np
+
+    C, T = data.shape
+    freqs = np.fft.rfftfreq(T, d=1.0 / fs)
+
+    plt.figure(figsize=(8, 4))
+    for c in range(C):
+        fft_vals = np.fft.rfft(data[c])
+        plt.plot(freqs, np.abs(fft_vals), alpha=0.4)
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Magnitude")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(filepath)
+    plt.close()
+
+
+def tsne_plot(features: np.ndarray,
+              labels: np.ndarray,
+              label_name: str,
+              filepath: str):
+    perplexity = min(30, max(5, features.shape[0] // 10))
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=0)
+    Z = tsne.fit_transform(features)
+
+    plt.figure(figsize=(7, 6))
+    sc = plt.scatter(Z[:, 0], Z[:, 1], c=labels, s=8, cmap="tab20")
+    plt.xticks([])
+    plt.yticks([])
+    cbar = plt.colorbar(sc, fraction=0.046, pad=0.04)
+    cbar.set_label(label_name)
+    plt.title(f"t-SNE of identity features colored by {label_name}")
+    plt.tight_layout()
+    plt.savefig(filepath, dpi=200)
+    plt.close()
+
+
+# -------------------------------------------------------------------
+# Blinder-style VAE (Encoder + Decoder as in Blinder's models.py)
+# -------------------------------------------------------------------
+
+class Encoder(nn.Module):
+    def __init__(self, z_dim, sample_size):
+        super().__init__()
+        self.z_dim = z_dim
+        self.sample_size = sample_size
+        self.fc1 = nn.Linear(sample_size, 512)
+        self.fc2 = nn.Linear(512, 512)
+        self.fc3 = nn.Linear(512, 256)
+        self.fc4 = nn.Linear(256, 128)
+        self.z_mean = nn.Linear(128, z_dim)
+        self.z_log_var = nn.Linear(128, z_dim)
+        self.relu = nn.ReLU()
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
+
+    def forward(self, x):
+        h1 = self.relu(self.fc1(x))
+        h2 = self.relu(self.fc2(h1))
+        h3 = self.relu(self.fc3(h2))
+        h4 = self.relu(self.fc4(h3))
+        z_m = self.z_mean(h4)
+        z_l = self.z_log_var(h4)
+        z = self.reparameterize(z_m, z_l)
+        return z, z_m, z_l
+
+
+class Decoder(nn.Module):
+    def __init__(self, z_dim, sample_size):
+        super().__init__()
+        self.sample_size = sample_size
+        self.fc1 = nn.Linear(z_dim, 128)
+        self.fc2 = nn.Linear(128, 256)
+        self.fc3 = nn.Linear(256, 512)
+        self.fc4 = nn.Linear(512, 512)
+        self.fc5 = nn.Linear(512, sample_size)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        h1 = self.relu(self.fc1(x))
+        h2 = self.relu(self.fc2(h1))
+        h3 = self.relu(self.fc3(h2))
+        h4 = self.relu(self.fc4(h3))
+        h5 = self.fc5(h4)
+        return h5
+
+
+class ECGBlinderVAE(nn.Module):
+    """
+    Simple Blinder-style VAE autoencoder for ECG:
+    - Uses Encoder/Decoder from the Blinder repo style.
+    - Trained only with reconstruction + KL (no explicit privacy adversary).
+    """
+    def __init__(self, T: int, C: int, z_dim: int):
+        super().__init__()
+        self.T = T
+        self.C = C
+        self.sample_size = T * C
+        self.encoder = Encoder(z_dim=z_dim, sample_size=self.sample_size)
+        self.decoder = Decoder(z_dim=z_dim, sample_size=self.sample_size)
+
+    def forward(self, x):
+        """
+        x: (N, T, C) standardized ECG.
+        Returns:
+          recon: (N, T, C), z_mean, z_logvar
+        """
+        N, T, C = x.shape
+        assert T == self.T and C == self.C
+        x_flat = x.view(N, -1)
+        z, z_m, z_l = self.encoder(x_flat)
+        recon_flat = self.decoder(z)
+        recon = recon_flat.view(N, T, C)
+        return recon, z_m, z_l
+
+
+def vae_loss(recon_x, x, mu, logvar):
+    recon = nn.MSELoss()(recon_x, x)
+    kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    return recon + 1e-3 * kld  # small KL weight
+
+
+def train_blinder_vae(X_std: np.ndarray, cfg: Config, scaler: StandardScaler) -> ECGBlinderVAE:
+    """
+    Train a simple VAE on standardized ECG windows.
+    """
+    N, T, C = X_std.shape
+    model = ECGBlinderVAE(T=T, C=C, z_dim=cfg.blinder_z_dim).to(cfg.device)
+
+    dataset = TensorDataset(torch.from_numpy(X_std.astype(np.float32)))
+    loader = DataLoader(dataset,
+                        batch_size=cfg.blinder_batch_size,
+                        shuffle=True,
+                        drop_last=False)
+
+    # opt = torch.optim.Adam(model.parameters(), lr=cfg.blinder_lr)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.blinder_lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.identity_epochs)
+    print(f"[BlinderVAE] Training for {cfg.blinder_epochs} epochs on {N} samples...")
+    for epoch in range(cfg.blinder_epochs):
+        model.train()
+        epoch_loss = 0.0
+        for (xb,) in loader:
+            xb = xb.to(cfg.device)
+            opt.zero_grad()
+            recon, mu, logvar = model(xb)
+            loss = vae_loss(recon, xb, mu, logvar)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+            epoch_loss += loss.item() * xb.size(0)
+        epoch_loss /= len(dataset)
+        print(f"[BlinderVAE] Epoch {epoch+1}/{cfg.blinder_epochs} loss={epoch_loss:.4f}")
+        sched.step()
+    torch.save(model.state_dict(), cfg.blinder_ckpt)
+    print(f"[BlinderVAE] Saved to {cfg.blinder_ckpt}")
+    return model
+
+
+def load_or_train_blinder_vae(X_std: np.ndarray,
+                              cfg: Config,
+                              scaler: StandardScaler) -> ECGBlinderVAE:
+    N, T, C = X_std.shape
+    model = ECGBlinderVAE(T=T, C=C, z_dim=cfg.blinder_z_dim).to(cfg.device)
+    if os.path.exists(cfg.blinder_ckpt):
+        print(f"[BlinderVAE] Loading existing checkpoint from {cfg.blinder_ckpt}")
+        state = torch.load(cfg.blinder_ckpt, map_location=cfg.device)
+        model.load_state_dict(state)
+        return model
+    else:
+        return train_blinder_vae(X_std, cfg, scaler)
+
+
+def anonymize_ecg_with_blinder(model: ECGBlinderVAE,
+                               X_std: np.ndarray,
+                               cfg: Config) -> np.ndarray:
+    """
+    Run the VAE over all standardized ECG windows.
+    """
+    model.eval()
+    X = X_std.astype(np.float32)
+    N, T, C = X.shape
+    anon = []
+
+    with torch.no_grad():
+        for start in range(0, N, cfg.blinder_batch_size):
+            end = min(start + cfg.blinder_batch_size, N)
+            xb = torch.from_numpy(X[start:end]).to(cfg.device)
+            recon, _, _ = model(xb)
+            anon.append(recon.cpu().numpy())
+
+    X_anon = np.concatenate(anon, axis=0)
+    X_anon = np.nan_to_num(X_anon, nan=0.0, posinf=5.0, neginf=-5.0)
+    assert X_anon.shape == X_std.shape
+    return X_anon
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
+def main():
+    print("=== ECG Privacy + Blinder-style Pipeline ===")
+
+    # 1) Load PTB-XL
+    data_dict = ecg_ptbxl.load_ptbxl_and_eda(
+        ptbxl_root=cfg.datafolder,
+        sampling_rate=cfg.sampling_frequency,
+        output_dir=os.path.join(cfg.results_dir, "ptbxl_eda"),
+        save_csv=False,
+    )
+    X = data_dict["X"]   # (N, T, C=12)
+    Y = data_dict["Y"]
+
+    # 2) Utility labels
+    print("Building utility labels...")
+    y_util, super_classes = build_utility_labels_from_superclass(Y)
+
+    # 3) Utility model
+    util_model, util_val_metrics, data_std, scaler = train_or_load_utility_model_from_ptbxl(
+        X, Y, y_util, cfg
+    )
+
+    # 4) Identity metadata (with per-patient split)
+    meta, id_info = build_identity_meta(Y, cfg)
+
+    # 5) Identity datasets/loaders
+    train_ds = IdentityDataset(data_std, meta, split="train")
+    val_ds = IdentityDataset(data_std, meta, split="val")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.identity_batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.identity_batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    # 6) Identity model
+    model_id = IdentityNet(
+        in_channels=data_std.shape[2],
+        n_patients=id_info["n_patients"],
+        n_age_bins=id_info["n_age_bins"],
+        n_height_bins=id_info["n_height_bins"],
+        n_weight_bins=id_info["n_weight_bins"],
+    )
+
+    if os.path.exists(cfg.identity_ckpt):
+        print(f"[Identity] Loading existing model from {cfg.identity_ckpt}")
+        state = torch.load(cfg.identity_ckpt, map_location=cfg.device)
+        model_id.load_state_dict(state)
+    else:
+        print("[Identity] Training from scratch...")
+        train_identity(model_id, train_loader, val_loader, cfg)
+        print(f"[Identity] Model saved to {cfg.identity_ckpt}")
+
+    print("[Identity] Evaluating on validation set (baseline)...")
+    id_val_metrics_base = eval_identity(model_id, val_loader, cfg)
+
+    # 7) Baseline fidelity (identity transform)
+    print("[Fidelity] Baseline (identity) on validation subset...")
+    val_row_idx = val_ds.meta["row_idx"].values
+    X_val_raw = X[val_row_idx]
+    X_val_anon_raw_base = X_val_raw  # identity
+
+    rmses_base = []
+    psd_corrs_base = []
+    for i in range(X_val_raw.shape[0]):
+        rmses_base.append(rmse(X_val_raw[i], X_val_anon_raw_base[i]))
+        psd_corrs_base.append(psd_correlation(X_val_raw[i],
+                                              X_val_anon_raw_base[i],
+                                              fs=cfg.sampling_frequency))
+    fidelity_baseline = {
+        "rmse_mean": float(np.mean(rmses_base)),
+        "rmse_std": float(np.std(rmses_base)),
+        "psd_corr_mean": float(np.mean(psd_corrs_base)),
+        "psd_corr_std": float(np.std(psd_corrs_base)),
+    }
+
+    # 8) FFT + t-SNE for baseline
+    print("[Plots] Baseline FFT and t-SNE...")
+    example_raw = X_val_raw[0]
+    fft_path_base = os.path.join(cfg.results_dir, "fft_val_raw_baseline.png")
+    plot_fft(example_raw, cfg.sampling_frequency,
+             "Validation ECG FFT (baseline raw)", fft_path_base)
+
+    model_id.eval()
+    all_feats_base, all_pid_base = [], []
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            xb = xb.to(cfg.device)
+            out = model_id(xb)
+            all_feats_base.append(out["feat"].cpu().numpy())
+            all_pid_base.extend(yb["patient"].numpy().tolist())
+    all_feats_base = np.concatenate(all_feats_base, axis=0)
+    all_feats_base = np.nan_to_num(all_feats_base)
+    all_pid_base = np.array(all_pid_base)
+
+    tsne_path_base = os.path.join(cfg.results_dir, "tsne_identity_val_baseline.png")
+    tsne_plot(all_feats_base,
+              all_pid_base,
+              label_name="patient_id (baseline raw)",
+              filepath=tsne_path_base)
+
+    # -----------------------------------------------------------
+    # 9) Blinder-style anonymization
+    # -----------------------------------------------------------
+    if cfg.use_blinder:
+        print("[BlinderVAE] Loading / training anonymizer...")
+        blinder_model = load_or_train_blinder_vae(data_std, cfg, scaler)
+
+        print("[BlinderVAE] Anonymizing full standardized ECG...")
+        data_std_anon = anonymize_ecg_with_blinder(blinder_model, data_std, cfg)
+
+        # Identity dataset on anonymized ECG
+        train_ds_anon = IdentityDataset(data_std_anon, meta, split="train")
+        val_ds_anon = IdentityDataset(data_std_anon, meta, split="val")
+        val_loader_anon = DataLoader(
+            val_ds_anon,
+            batch_size=cfg.identity_batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+
+        print("[Identity] Evaluating on anonymized validation set...")
+        id_val_metrics_anon = eval_identity(model_id, val_loader_anon, cfg)
+
+        # Utility on anonymized ECG (fold 10)
+        val_mask = Y["strat_fold"] == 10
+        X_val_std_anon = data_std_anon[val_mask]
+        y_val = y_util[val_mask]
+        util_val_metrics_anon = eval_utility_on_data(util_model,
+                                                     X_val_std_anon,
+                                                     y_val)
+
+        # Fidelity between raw and anonymized (val subset)
+        print("[Fidelity] Blinder-style anonymization on validation subset...")
+        X_val_std_anon = data_std_anon[val_row_idx]
+        N_val, T, C = X_val_std_anon.shape
+        X_val_anon_flat = X_val_std_anon.reshape(N_val, -1)
+        X_val_anon_raw = scaler.inverse_transform(X_val_anon_flat).reshape(N_val, T, C)
+
+        rmses_blinder, psd_blinder = [], []
+        for i in range(N_val):
+            rmses_blinder.append(rmse(X_val_raw[i], X_val_anon_raw[i]))
+            psd_blinder.append(
+                psd_correlation(X_val_raw[i], X_val_anon_raw[i],
+                                fs=cfg.sampling_frequency)
+            )
+
+        fidelity_blinder = {
+            "rmse_mean": float(np.mean(rmses_blinder)),
+            "rmse_std": float(np.std(rmses_blinder)),
+            "psd_corr_mean": float(np.mean(psd_blinder)),
+            "psd_corr_std": float(np.std(psd_blinder)),
+        }
+
+        # FFT + t-SNE after anonymization
+        print("[Plots] FFT and t-SNE after Blinder-style anonymization...")
+        example_anon_raw = X_val_anon_raw[0]
+        fft_path_anon = os.path.join(cfg.results_dir, "fft_val_anon_blinder.png")
+        plot_fft(example_anon_raw, cfg.sampling_frequency,
+                 "Validation ECG FFT (Blinder-style anonymized)", fft_path_anon)
+
+        model_id.eval()
+        all_feats_anon, all_pid_anon = [], []
+        with torch.no_grad():
+            for xb, yb in val_loader_anon:
+                xb = xb.to(cfg.device)
+                out = model_id(xb)
+                all_feats_anon.append(out["feat"].cpu().numpy())
+                all_pid_anon.extend(yb["patient"].numpy().tolist())
+        all_feats_anon = np.concatenate(all_feats_anon, axis=0)
+        all_pid_anon = np.array(all_pid_anon)
+
+        tsne_path_anon = os.path.join(cfg.results_dir,
+                                      "tsne_identity_val_blinder.png")
+        tsne_plot(all_feats_anon,
+                  all_pid_anon,
+                  label_name="patient_id (Blinder-style anon)",
+                  filepath=tsne_path_anon)
+    else:
+        id_val_metrics_anon = None
+        util_val_metrics_anon = None
+        fidelity_blinder = None
+        fft_path_anon = None
+        tsne_path_anon = None
+
+    # 10) Save everything
+    results = {
+        "identity_val_metrics_baseline": id_val_metrics_base,
+        "identity_val_metrics_blinder": id_val_metrics_anon,
+        "utility_val_metrics_baseline": util_val_metrics,
+        "utility_val_metrics_blinder": util_val_metrics_anon,
+        "fidelity_baseline": fidelity_baseline,
+        "fidelity_blinder": fidelity_blinder,
+        "plots": {
+            "fft_val_raw_baseline": fft_path_base,
+            "tsne_identity_val_baseline": tsne_path_base,
+            "fft_val_anon_blinder": fft_path_anon,
+            "tsne_identity_val_blinder": tsne_path_anon,
+        },
+    }
+    out_json = os.path.join(cfg.results_dir, "privacy_blinder_metrics.json")
+    with open(out_json, "w") as f:
+        json.dump(results, f, indent=2)
+
+    print("=== Done ===")
+    print(f"Metrics JSON: {out_json}")
+
+
+if __name__ == "__main__":
+    main()
