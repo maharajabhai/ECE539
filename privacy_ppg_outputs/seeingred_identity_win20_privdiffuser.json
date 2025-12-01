@@ -1,0 +1,26 @@
+{
+  "raw_NOFTA_SVM_win20": {
+    "eer_mean": 0.08766483516508661,
+    "eer_std": 0.09876508886577716
+  },
+  "raw_NOFTA_GBT_win20": {
+    "eer_mean": 0.000274725274772442,
+    "eer_std": 0.0014275144020875698
+  },
+  "raw_NOFTA_RF_win20": {
+    "eer_mean": 0.0,
+    "eer_std": 0.0
+  },
+  "anon_NOFTA_SVM_win20": {
+    "eer_mean": 0.48356922593083357,
+    "eer_std": 0.22237086367936898
+  },
+  "anon_NOFTA_GBT_win20": {
+    "eer_mean": 0.3371212121212446,
+    "eer_std": 0.32511829449847285
+  },
+  "anon_NOFTA_RF_win20": {
+    "eer_mean": 0.31859381195683906,
+    "eer_std": 0.33493678893210244
+  }
+}

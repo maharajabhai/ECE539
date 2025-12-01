@@ -1,0 +1,47 @@
+{
+  "identity_baseline": {
+    "loss": 2.166234254837036,
+    "acc": 0.13043478260869565,
+    "f1_macro": 0.11904761904761904
+  },
+  "identity_blinder": {
+    "loss": 13.926684379577637,
+    "acc": 0.08695652173913043,
+    "f1_macro": 0.011428571428571429
+  },
+  "quality_raw": {
+    "ampl_span": 0.0,
+    "granularity": 0.0,
+    "norm_min": 0.0,
+    "norm_max": 0.0
+  },
+  "quality_blinder": {
+    "ampl_span": 0.0,
+    "granularity": 0.0,
+    "norm_min": 0.0,
+    "norm_max": 0.0
+  },
+  "pulse_rate": {
+    "bpm_raw_mean": 72.22218966136387,
+    "bpm_anon_mean": 92.77352550305012,
+    "bpm_abs_diff_mean": 31.002620741378326
+  },
+  "hrv_raw": {
+    "rmssd_mean": 0.3297811927224558,
+    "sdnn_mean": 0.30232648757405595,
+    "pnn50_mean": 0.5416737424104076
+  },
+  "hrv_blinder": {
+    "rmssd_mean": 0.41535389684538954,
+    "sdnn_mean": 0.29034685461926524,
+    "pnn50_mean": 0.8738322513257512
+  },
+  "resp_rate_raw": {
+    "resp_rate_mean": 7.642663043478261,
+    "resp_rate_std": 1.6883194489586506
+  },
+  "resp_rate_blinder": {
+    "resp_rate_mean": 7.489809782608695,
+    "resp_rate_std": 1.1839962675226479
+  }
+}

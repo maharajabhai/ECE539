@@ -40,7 +40,7 @@ from torch.utils.data import Dataset, DataLoader
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))          # .../ECE539/scripts
 PROJECT_ROOT = os.path.dirname(THIS_DIR)                       # .../ECE539
 TOP_LEVEL = os.path.dirname(PROJECT_ROOT)                      # .../
-PRIVDIFFUSER_DIR = os.path.join(PROJECT_ROOT, "PrivDiffuser-main")
+PRIVDIFFUSER_DIR = os.path.join(PROJECT_ROOT, "PrivDiffuser")
 
 for p in [THIS_DIR, PROJECT_ROOT, TOP_LEVEL, PRIVDIFFUSER_DIR]:
     if p not in sys.path:
@@ -101,8 +101,9 @@ class EMGDiffusionConfig:
     eta: float = 0.0            # DDIM noise eta
     select: str = "linear"      # DDIM schedule strategy
     w1: float = 2.0             # classifier-free guidance strength
+    w2: float = 1.0             # negative identity guidance strength
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size: int = 128
+    batch_size: int = 64         # smaller to reduce GPU footprint
     # store under project_root/models/emg_privdiffuser
     model_dir: str = os.path.join(PROJECT_ROOT, "models", "emg_privdiffuser")
 
@@ -151,7 +152,25 @@ class EMGPrivDiffuserDataset(Dataset):
     def __getitem__(self, idx):
         x = torch.tensor(self.X[idx], dtype=torch.float32)
         y_pub = torch.tensor(self.y_pub[idx], dtype=torch.long)
-        return x, y_pub
+        y_priv = torch.tensor(self.meta["subject_idx"].values[idx], dtype=torch.long)
+        return x, y_pub, y_priv
+
+
+class IdentityWrapper(nn.Module):
+    """Allow PrivDiffuser cond_fn to call identity classifier with optional emb argument."""
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.base = base_model
+
+    def forward(self, x, emb=None):
+        # cond_fn passes (B,1,C,T); identity expects (B,C,T)
+        if x.dim() == 4:
+            x = x.squeeze(1)
+        out = self.base(x)
+        # base returns dict with 'logits'; cond_fn expects logits tensor
+        if isinstance(out, dict) and "logits" in out:
+            return out["logits"]
+        return out
 
 
 # -------------------------------------------------------------------------
@@ -215,6 +234,7 @@ def train_and_apply_privdiffuser_emg(
     meta,
     diff_cfg: EMGDiffusionConfig,
     utility_model: GestureUtilityNet,
+    identity_model: SubjectIdentityNet,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Train OR load PrivDiffuser-style diffusion model on EMG and anonymize val windows.
@@ -241,16 +261,16 @@ def train_and_apply_privdiffuser_emg(
         batch_size=diff_cfg.batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=2,
+        pin_memory=False,
     )
     val_loader_diff = DataLoader(
         val_ds,
         batch_size=diff_cfg.batch_size,
         shuffle=False,
         drop_last=False,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=2,
+        pin_memory=False,
     )
 
     # ----------------------- Surrogate utility (frozen) ----------------
@@ -259,6 +279,8 @@ def train_and_apply_privdiffuser_emg(
         z_dim=diff_cfg.cdim,
         device=device,
     )
+    identity_model = identity_model.to(device)
+    identity_model.eval()
 
     # ----------------------- U-Net + Diffusion ------------------------
     net = Unet(
@@ -323,7 +345,11 @@ def train_and_apply_privdiffuser_emg(
             epoch_loss = 0.0
             num_batches = 0
 
-            for x_img, _ in train_loader_diff:
+            for batch in train_loader_diff:
+                if len(batch) == 3:
+                    x_img, _, _ = batch
+                else:
+                    x_img, _ = batch
                 x_img = x_img.to(device)
                 b = x_img.size(0)
                 optimizer.zero_grad()
@@ -363,12 +389,16 @@ def train_and_apply_privdiffuser_emg(
     cemblayer.eval()
     surrogate.eval()
 
-    recon_imgs_list = []
     val_row_idx = val_ds.meta["row_idx"].values  # index mapping back to full X_std
+    recon_imgs = np.empty((len(val_ds), 1, val_ds.X.shape[2], val_ds.X.shape[3]), dtype=np.float32)
 
     with torch.no_grad():
-        for x_img, _ in val_loader_diff:
+        offset = 0
+        for batch in val_loader_diff:
+            # Dataset always returns (x_img, y_pub, y_priv); keep priv labels for guidance
+            x_img, _, y_priv = batch
             x_img = x_img.to(device)
+            y_priv = y_priv.to(device)
             B = x_img.size(0)
 
             _, emb = surrogate(x_img)
@@ -376,23 +406,26 @@ def train_and_apply_privdiffuser_emg(
 
             genshape = x_img.shape  # (B,1,C,T)
 
-            # We pass priv_classifier=None and w2=0 (no explicit negative guidance)
+            priv_classifier = IdentityWrapper(identity_model.to(device))
+            priv_classifier.eval()
             generated = diffusion.ddim_sample(
                 genshape,
                 diff_cfg.num_steps,
                 diff_cfg.eta,
                 diff_cfg.select,
-                priv_classifier=None,
-                priv_y=None,
+                priv_classifier=priv_classifier,
+                priv_y=y_priv,
                 emb=emb,
                 w1=diff_cfg.w1,
-                w2=0.0,
+                w2=diff_cfg.w2,
                 cemb=cemb,
             )
 
-            recon_imgs_list.append(generated.detach().cpu().numpy())
+            recon_np = generated.detach().cpu().numpy()
+            recon_imgs[offset:offset + B] = recon_np
+            offset += B
 
-    recon_imgs = np.concatenate(recon_imgs_list, axis=0)   # (N_val,1,C,T)
+    # (N_val,1,C,T)
     # -> (N_val,C,T) -> (N_val,T,C)
     recon_ct = np.squeeze(recon_imgs, axis=1)              # (N_val,C,T)
     X_val_anon_std = np.transpose(recon_ct, (0, 2, 1))     # (N_val,T,C)
@@ -460,6 +493,10 @@ def main():
 
     print("[Identity] Evaluating baseline on original standardized EMG...")
     id_metrics_base = eval_identity(id_model, val_loader_id, cfg)
+    # Move identity model off GPU to free memory before diffusion training
+    id_model.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # 5) Utility (gesture) model: train / load + baseline
     train_ds_ut = UtilityDatasetEMG(X_std, meta, split="train")
@@ -504,6 +541,7 @@ def main():
         meta=meta,
         diff_cfg=diff_cfg,
         utility_model=ut_model,
+        identity_model=id_model,
     )
 
     # 7) Build anonymized datasets & loaders for evaluation
@@ -524,6 +562,9 @@ def main():
         num_workers=4,
         pin_memory=True,
     )
+
+    # Bring identity model back for evaluation on anonymized data
+    id_model.to(cfg.device)
 
     print("[Identity] Evaluating on PrivDiffuser-anonymized EMG...")
     id_metrics_anon = eval_identity(id_model, val_loader_id_anon, cfg)

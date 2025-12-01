@@ -31,6 +31,7 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 
 from scipy import signal
 import matplotlib.pyplot as plt
+from ecg_priv_common import compute_diag_metrics_thresholded
 
 # -------------------------------------------------------------------
 # Path setup
@@ -435,17 +436,14 @@ def train_or_load_utility_model_from_ptbxl(
     utils.evaluate_experiment(y_val, y_val_pred)
 
     probs = y_val_pred
-    y_hat = (probs >= 0.5).astype(np.float32)
     y_true = y_val.astype(np.float32)
-
-    sample_acc = np.mean(np.all(y_true == y_hat, axis=1))
-    f1 = f1_score(y_true.flatten(), y_hat.flatten(), average="binary")
-    mae = mean_absolute_error(y_true.flatten(), probs.flatten())
-
+    metrics_basic = compute_diag_metrics_thresholded(probs, y_true, thresh=0.5)
     metrics = {
-        "utility_sample_acc": float(sample_acc),
-        "utility_f1": float(f1),
-        "utility_mae": float(mae),
+        "utility_sample_acc": metrics_basic["sample_acc"],
+        "utility_f1": metrics_basic["macro_f1"],  # keep legacy key for F1
+        "utility_mae": metrics_basic["mae"],
+        "utility_macro_f1": metrics_basic["macro_f1"],
+        "utility_macro_acc": metrics_basic["macro_acc"],
     }
     print("[Utility] Validation metrics:")
     for k, v in metrics.items():
@@ -458,17 +456,13 @@ def eval_utility_on_data(model, X_val_std: np.ndarray, y_val: np.ndarray) -> Dic
     probs = model.predict(X_val_std)
     probs = np.nan_to_num(probs, nan=0.0, posinf=5.0, neginf=-5.0)
 
-    y_hat = (probs >= 0.5).astype(np.float32)
-    y_true = y_val.astype(np.float32)
-
-    sample_acc = np.mean(np.all(y_true == y_hat, axis=1))
-    f1 = f1_score(y_true.flatten(), y_hat.flatten(), average="binary")
-    mae = mean_absolute_error(y_true.flatten(), probs.flatten())
-
+    metrics_basic = compute_diag_metrics_thresholded(probs, y_true, thresh=0.5)
     metrics = {
-        "utility_sample_acc": float(sample_acc),
-        "utility_f1": float(f1),
-        "utility_mae": float(mae),
+        "utility_sample_acc": metrics_basic["sample_acc"],
+        "utility_f1": metrics_basic["macro_f1"],
+        "utility_mae": metrics_basic["mae"],
+        "utility_macro_f1": metrics_basic["macro_f1"],
+        "utility_macro_acc": metrics_basic["macro_acc"],
     }
     print("[Utility|Anon] Validation metrics on anonymized data:")
     for k, v in metrics.items():
