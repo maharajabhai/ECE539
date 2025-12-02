@@ -4,22 +4,22 @@
     "subject_f1": 0.8179756217093247
   },
   "identity_privdiffuser": {
-    "subject_acc": 0.0009772782799902272,
-    "subject_f1": 0.001017384485733623
+    "subject_acc": 0.2837364606238293,
+    "subject_f1": 0.27911238028646324
   },
   "utility_baseline": {
     "gesture_acc": 0.8285691017183809,
     "gesture_f1": 0.7541566680216301
   },
   "utility_privdiffuser": {
-    "gesture_acc": 0.2008306865379917,
-    "gesture_f1": 0.034342224048256376
+    "gesture_acc": 0.45533023861878,
+    "gesture_f1": 0.17463308626493604
   },
   "fidelity_privdiffuser": {
-    "rmse_mean": 0.5869236230555631,
-    "rmse_std": 0.7524374752062053,
-    "psd_corr_mean": 0.3459331277856764,
-    "psd_corr_std": 0.4214431093806408
+    "rmse_mean": 0.3106095034480295,
+    "rmse_std": 0.30677670771297844,
+    "psd_corr_mean": 0.8919907987977176,
+    "psd_corr_std": 0.1850810821851972
   },
   "plots": {
     "fft_raw": "/home/simran/ECE539/emg_privacy_outputs/emg_fft_val_raw.png",
