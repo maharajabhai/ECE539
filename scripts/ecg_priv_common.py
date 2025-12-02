@@ -8,7 +8,7 @@ Shared helpers for ECG privacy pipelines (Blinder/PrivDiffuser):
 from typing import Dict, Optional
 import numpy as np
 import torch
-from sklearn.metrics import f1_score, mean_absolute_error
+from sklearn.metrics import f1_score, mean_absolute_error, roc_auc_score, average_precision_score
 
 
 def compute_diag_metrics_thresholded(probs: np.ndarray, y_true: np.ndarray, thresh: float = 0.5) -> Dict[str, float]:
@@ -17,7 +17,8 @@ def compute_diag_metrics_thresholded(probs: np.ndarray, y_true: np.ndarray, thre
     - sample-level exact match accuracy
     - macro F1 over labels
     - macro per-class accuracy
-    - MAE on probabilities
+    - macro/micro AUROC and AP
+    - MAE on probabilities (calibration-ish)
     """
     probs = np.nan_to_num(probs, nan=0.0, posinf=5.0, neginf=-5.0)
     y_hat = (probs >= thresh).astype(np.float32)
@@ -29,10 +30,25 @@ def compute_diag_metrics_thresholded(probs: np.ndarray, y_true: np.ndarray, thre
     macro_acc = float(np.mean(per_class_acc))
     mae = float(mean_absolute_error(y_true.flatten(), probs.flatten()))
 
+    def safe_metric(fn, **kwargs):
+        try:
+            return float(fn(y_true, probs, **kwargs))
+        except Exception:
+            return float("nan")
+
+    auc_macro = safe_metric(roc_auc_score, average="macro")
+    auc_micro = safe_metric(roc_auc_score, average="micro")
+    ap_macro = safe_metric(average_precision_score, average="macro")
+    ap_micro = safe_metric(average_precision_score, average="micro")
+
     return {
         "sample_acc": sample_acc,
         "macro_f1": macro_f1,
         "macro_acc": macro_acc,
+        "auc_macro": auc_macro,
+        "auc_micro": auc_micro,
+        "ap_macro": ap_macro,
+        "ap_micro": ap_micro,
         "mae": mae,
     }
 

@@ -84,23 +84,23 @@ class DiagnosisClassifier(nn.Module):
 
 
 class HeartRateRegressor(nn.Module):
-    def __init__(self, in_channels: int, embed_dim: int = 128, dropout: float = 0.1):
+    def __init__(self, in_channels: int, embed_dim: int = 96, dropout: float = 0.1):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(32),
+            nn.Conv1d(in_channels, 24, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(24),
             nn.ReLU(inplace=True),
-            nn.Conv1d(32, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(64),
+            nn.Conv1d(24, 48, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(48),
             nn.ReLU(inplace=True),
-            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(48, 96, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(96),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool1d(1),
         )
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(128, 1)
-        self.embed_proj = nn.Linear(128, embed_dim)
+        self.head = nn.Linear(96, 1)
+        self.embed_proj = nn.Linear(96, embed_dim)
 
     def forward(self, x):
         h = self.features(x).squeeze(-1)   # (B, 128)
@@ -137,12 +137,20 @@ def compute_bpm_labels(X_raw: np.ndarray, fs: int) -> np.ndarray:
         import wfdb
         labels = []
         for win in X_raw:
-            sig = win if win.shape[0] > win.shape[1] else win.T
-            lead0 = sig[:, 0]
-            qrs_locs = wfdb.processing.gqrs_detect(sig=lead0, fs=fs)
+            sig = win if win.shape[0] > win.shape[1] else win.T  # (T, C)
+            # choose lead with highest bandpassed std
+            b, a = signal.butter(2, [5, 25], btype="bandpass", fs=fs)
+            stds = []
+            filtered = []
+            for c in range(sig.shape[1]):
+                f = signal.filtfilt(b, a, sig[:, c])
+                filtered.append(f)
+                stds.append(np.std(f))
+            best = filtered[int(np.argmax(stds))]
+            qrs_locs = wfdb.processing.gqrs_detect(sig=best, fs=fs)
             # optional refinement
             try:
-                qrs_locs = wfdb.processing.correct_peaks(lead0, qrs_locs, search_radius=int(0.1 * fs), fs=fs, tol=0.1)
+                qrs_locs = wfdb.processing.correct_peaks(best, qrs_locs, search_radius=int(0.1 * fs), fs=fs, tol=0.1)
             except Exception:
                 pass
             if len(qrs_locs) < 2:

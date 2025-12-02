@@ -1,0 +1,68 @@
+{
+  "identity_val_metrics_baseline": {
+    "patient_acc": 0.2875,
+    "patient_f1": 0.23344356261022925,
+    "sex_acc": 0.7625,
+    "sex_f1": 0.68846075015372,
+    "age_acc": 0.5375,
+    "age_f1": 0.37292572292572296,
+    "height_acc": 0.9875,
+    "height_f1": 0.4968553459119497,
+    "weight_acc": 0.9375,
+    "weight_f1": 0.45577342047930286
+  },
+  "identity_val_metrics_blinder": {
+    "patient_acc": 0.0375,
+    "patient_f1": 0.01539351851851852,
+    "sex_acc": 0.675,
+    "sex_f1": 0.4666666666666667,
+    "age_acc": 0.4875,
+    "age_f1": 0.26139784946236555,
+    "height_acc": 0.9875,
+    "height_f1": 0.4968553459119497,
+    "weight_acc": 0.9375,
+    "weight_f1": 0.3225806451612903
+  },
+  "utility_val_metrics_baseline": {
+    "utility_sample_acc": 0.7031643540779411,
+    "utility_f1": 0.7369931941088489,
+    "utility_mae": 0.1381690353155136,
+    "utility_macro_f1": 0.7369931941088489,
+    "utility_macro_acc": 0.9101066996382287
+  },
+  "utility_val_metrics_blinder": {
+    "utility_sample_acc": 0.14965425653707012,
+    "utility_f1": 0.2565282856261319,
+    "utility_mae": 0.43306198716163635,
+    "utility_macro_f1": 0.2565282856261319,
+    "utility_macro_acc": 0.6016394193341577
+  },
+  "bpm_baseline": {
+    "bpm_raw_mean": 114.2542953491211,
+    "bpm_mae": 0.0
+  },
+  "bpm_blinder": {
+    "bpm_raw_mean": 114.2542953491211,
+    "bpm_anon_mean": 149.3431854248047,
+    "bpm_mae": 41.148643493652344
+  },
+  "fidelity_baseline": {
+    "rmse_mean": 0.0,
+    "rmse_std": 0.0,
+    "psd_corr_mean": 1.0000000067055226,
+    "psd_corr_std": 7.114816849911458e-08
+  },
+  "fidelity_blinder": {
+    "rmse_mean": 0.21216446310281753,
+    "rmse_std": 0.0886723955712349,
+    "psd_corr_mean": 0.7706083627737825,
+    "psd_corr_std": 0.33514907974679736
+  },
+  "plots": {
+    "fft_val_raw_baseline": "/home/simran/ECE539/privacy_baseline_outputs/fft_val_raw_baseline.png",
+    "tsne_identity_val_baseline": "/home/simran/ECE539/privacy_baseline_outputs/tsne_identity_val_baseline.png",
+    "fft_val_anon_blinder": "/home/simran/ECE539/privacy_baseline_outputs/fft_val_anon_blinder.png",
+    "tsne_identity_val_blinder": "/home/simran/ECE539/privacy_baseline_outputs/tsne_identity_val_blinder.png",
+    "overlay_dir": "/home/simran/ECE539/privacy_baseline_outputs/overlay_examples"
+  }
+}

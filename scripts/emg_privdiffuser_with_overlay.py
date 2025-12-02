@@ -101,7 +101,7 @@ class EMGDiffusionConfig:
     eta: float = 0.0            # DDIM noise eta
     select: str = "linear"      # DDIM schedule strategy
     w1: float = 2.0             # classifier-free guidance strength
-    w2: float = 1.0             # negative identity guidance strength
+    w2: float = 0.05            # negative identity guidance strength
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 64         # smaller to reduce GPU footprint
     # store under project_root/models/emg_privdiffuser

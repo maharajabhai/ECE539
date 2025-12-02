@@ -29,8 +29,6 @@ from ecg_priv_common import compute_diag_metrics_thresholded
 from ecg_priv_models import (
     DiagnosisDataset,
     DiagnosisClassifier,
-    ECGHeartRateDataset,
-    HeartRateRegressor,
     compute_bpm_labels,
 )
 from ptbxl_loader import load_ptbxl
@@ -63,6 +61,7 @@ from ecg_blinder_pipeline_with_overlay import (
     plot_fft,
     plot_overlay_ecg,
 )
+ECGConfig.min_samples_per_patient = 5
 
 # -------------------------------------------------------------------------
 # Import PrivDiffuser core modules (root of PrivDiffuser-main)
@@ -80,13 +79,13 @@ from PrivDiffuser.utils import get_named_beta_schedule
 @dataclass
 class ECGDiffusionConfig:
     inch: int = 1
-    modch: int = 64
+    modch: int = 32  # smaller base channels to ease GPU memory
     outch: int = 1
     T: int = 1000
-    chmul: Tuple[int, ...] = (1, 2)
-    numres: int = 2
-    cdim: int = 64
-    useconv: bool = True
+    chmul: Tuple[int, ...] = (1,)  # single stage to keep layers minimal
+    numres: int = 1                # one resblock per stage
+    cdim: int = 96
+    useconv: bool = True  # keep conv; attention layers remain but with smaller dims
     droprate: float = 0.1
     dtype: torch.dtype = torch.float32
     lr: float = 2e-4
@@ -96,21 +95,26 @@ class ECGDiffusionConfig:
     num_steps: int = 50
     eta: float = 0.0
     select: str = "linear"
-    w1: float = 2.0
+    # w1 scales positive utility guidance (classifier-free)
+    # w2 scales negative privacy (identity) guidance
+    w1: float = 0.05
+    w2: float = 0.05
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size: int = 64
+    batch_size: int = 2   # small but >1 to avoid collapse
     model_dir: str = os.path.join(PROJECT_ROOT, "models", "ecg_privdiffuser")
-    identity_ckpt: str = os.path.join(PROJECT_ROOT, "models", "ecg_privdiffuser", "identity_best.pt")
+    identity_ckpt: str = os.path.join(PROJECT_ROOT, "scripts", "identity_best.pt")
     hr_ckpt: str = os.path.join(PROJECT_ROOT, "models", "ecg_privdiffuser", "hr_surrogate.pt")
+    # optionally truncate long sequences to ease attention memory
+    max_timesteps: int = None
 
     # Heart-rate surrogate
     hr_epochs: int = 40
-    hr_batch_size: int = 128
-    hr_lr: float = 1e-3
+    hr_batch_size: int = 32
+    hr_lr: float = 5e-4
     diag_epochs: int = 40
     diag_lr: float = 1e-3
     diag_pos_weight: float = 1.0
-    # utility_target: "diagnosis" or "heart_rate"
+    # utility_target fixed to diagnosis
     utility_target: str = "diagnosis"
 
 
@@ -121,29 +125,31 @@ class ECGDiffusionConfig:
 def estimate_bpm_from_window(x_raw: np.ndarray, fs: int) -> float:
     """
     Estimate heart rate from a single ECG window using R-peak detection.
-    x_raw: (T, C) or (C, T)
+    Pick the lead with the strongest band-passed energy to improve robustness.
     """
-    if x_raw.shape[0] < x_raw.shape[1]:
-        x = x_raw.T  # -> (T, C)
-    else:
-        x = x_raw
-
-    lead0 = x[:, 0]
-    # Simple bandpass to emphasize QRS
+    x = x_raw if x_raw.shape[0] > x_raw.shape[1] else x_raw.T  # (T, C)
+    T, C = x.shape
     b, a = signal.butter(2, [5, 25], btype="bandpass", fs=fs)
-    filt = signal.filtfilt(b, a, lead0)
-    distance = int(0.3 * fs)  # min 200 bpm upper bound
-    peaks, _ = signal.find_peaks(filt, distance=distance, prominence=np.std(filt) * 0.5)
-
+    # choose best lead by std after bandpass
+    filt_all = []
+    stds = []
+    for c in range(C):
+        filt = signal.filtfilt(b, a, x[:, c])
+        filt_all.append(filt)
+        stds.append(np.std(filt))
+    best_idx = int(np.argmax(stds))
+    filt = filt_all[best_idx]
+    distance = int(0.3 * fs)  # min peak distance (~200 bpm upper bound)
+    prom = np.std(filt) * 0.5
+    peaks, _ = signal.find_peaks(filt, distance=distance, prominence=prom)
     if len(peaks) < 2:
         return 0.0
-
     rr = np.diff(peaks) / fs  # seconds
-    rr = rr[rr > 1e-3]
+    rr = rr[(rr > 0.25) & (rr < 2.0)]  # 30–240 bpm
     if len(rr) == 0:
         return 0.0
     bpm = 60.0 / np.median(rr)
-    return float(np.clip(bpm, 20.0, 220.0))
+    return float(np.clip(bpm, 30.0, 220.0))
 
 
 def compute_bpm_labels(X_raw: np.ndarray, fs: int) -> np.ndarray:
@@ -290,7 +296,7 @@ def train_heart_rate_regressor(model: HeartRateRegressor,
     opt = torch.optim.Adam(model.parameters(), lr=diff_cfg.hr_lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=diff_cfg.hr_epochs, eta_min=diff_cfg.hr_lr * 0.1)
     best_val = float("inf")
-    mae_loss = nn.L1Loss()
+    mae_loss = nn.SmoothL1Loss(beta=1.0)
 
     for ep in range(diff_cfg.hr_epochs):
         model.train()
@@ -417,21 +423,21 @@ def train_diagnosis_classifier(
     except Exception:
         auroc_macro = None
 
-        if val_loss < best_val:
-            best_val = val_loss
-        # optional thresholded metrics for logging
+    if val_loss < best_val:
+        best_val = val_loss
+    # optional thresholded metrics for logging
+    diag_metrics = {}
+    try:
+        probs = torch.sigmoid(torch.cat(all_logits, dim=0)).cpu().numpy()
+        labels = torch.cat(all_labels, dim=0).cpu().numpy()
+        diag_metrics = compute_diag_metrics_thresholded(probs, labels, thresh=0.5)
+    except Exception:
         diag_metrics = {}
-        try:
-            probs = torch.sigmoid(torch.cat(all_logits, dim=0)).cpu().numpy()
-            labels = torch.cat(all_labels, dim=0).cpu().numpy()
-            diag_metrics = compute_diag_metrics_thresholded(probs, labels, thresh=0.5)
-        except Exception:
-            diag_metrics = {}
 
-        msg = f"[Diagnosis] Epoch {ep+1}/{cfg.diag_epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f}"
-        if diag_metrics:
-            msg += f" sample_acc={diag_metrics['sample_acc']:.4f} macro_f1={diag_metrics['macro_f1']:.4f}"
-        print(msg)
+    msg = f"[Diagnosis] Epoch {ep+1}/{cfg.diag_epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f}"
+    if diag_metrics:
+        msg += f" sample_acc={diag_metrics['sample_acc']:.4f} macro_f1={diag_metrics['macro_f1']:.4f}"
+    print(msg)
 
     return {"train_bce": train_loss, "val_bce": val_loss, "val_auroc_macro": auroc_macro}
 
@@ -616,7 +622,7 @@ def train_and_apply_privdiffuser_ecg(X_std: np.ndarray,
                 priv_y=y_priv,
                 emb=emb,
                 w1=diff_cfg.w1,
-                w2=diff_cfg.w1,  # reuse w1 for negative guidance strength
+                w2=diff_cfg.w2,
                 cemb=cemb,
             )
             recon_np = generated.detach().cpu().numpy()
@@ -711,77 +717,44 @@ def main():
         torch.cuda.empty_cache()
 
     # 5) Utility surrogate
-    utility_kind = diff_cfg.utility_target.lower()
+    utility_kind = "diagnosis"
     diag_metrics = diag_metrics_raw = diag_metrics_anon = None
     diag_thresh_raw = diag_thresh_anon = None
-    hr_metrics = None
 
-    if utility_kind == "diagnosis":
-        print("[Diagnosis] Building multi-label diagnosis targets...")
-        y_diag, diag_classes = build_utility_labels_from_superclass(Y)
-        train_ds_diag = DiagnosisDataset(X_std, y_diag, meta, split="train")
-        val_ds_diag = DiagnosisDataset(X_std, y_diag, meta, split="val")
-        train_loader_diag = DataLoader(
-            train_ds_diag,
-            batch_size=diff_cfg.hr_batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-        )
-        val_loader_diag = DataLoader(
-            val_ds_diag,
-            batch_size=diff_cfg.hr_batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-        )
+    print("[Diagnosis] Building multi-label diagnosis targets...")
+    y_diag, diag_classes = build_utility_labels_from_superclass(Y)
+    train_ds_diag = DiagnosisDataset(X_std, y_diag, meta, split="train")
+    val_ds_diag = DiagnosisDataset(X_std, y_diag, meta, split="val")
+    train_loader_diag = DataLoader(
+        train_ds_diag,
+        batch_size=diff_cfg.hr_batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+    val_loader_diag = DataLoader(
+        val_ds_diag,
+        batch_size=diff_cfg.hr_batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
 
-        diag_model = DiagnosisClassifier(in_channels=C, n_classes=y_diag.shape[1], embed_dim=diff_cfg.cdim)
-        diag_ckpt = os.path.join(diff_cfg.model_dir, "diag_surrogate.pt")
-        if os.path.isfile(diag_ckpt):
-            print(f"[Diagnosis] Loading surrogate from {diag_ckpt}")
-            state = torch.load(diag_ckpt, map_location=diff_cfg.device)
-            diag_model.load_state_dict(state)
-            diag_metrics = {"train_bce": None, "val_bce": None, "val_auroc_macro": None}
-        else:
-            print("[Diagnosis] Training diagnosis surrogate (multi-label)...")
-            diag_metrics = train_diagnosis_classifier(diag_model, train_loader_diag, val_loader_diag, diff_cfg)
-            torch.save(diag_model.state_dict(), diag_ckpt)
-            print(f"[Diagnosis] Saved surrogate to {diag_ckpt}")
-        diag_model.to(diff_cfg.device)
-        diag_metrics_raw = eval_diagnosis(diag_model, val_loader_diag, diff_cfg.device)
-        utility_model = diag_model
+    diag_model = DiagnosisClassifier(in_channels=C, n_classes=y_diag.shape[1], embed_dim=diff_cfg.cdim)
+    diag_ckpt = os.path.join(diff_cfg.model_dir, "diag_surrogate.pt")
+    if os.path.isfile(diag_ckpt):
+        print(f"[Diagnosis] Loading surrogate from {diag_ckpt}")
+        state = torch.load(diag_ckpt, map_location=diff_cfg.device)
+        diag_model.load_state_dict(state)
+        diag_metrics = {"train_bce": None, "val_bce": None, "val_auroc_macro": None}
     else:
-        print("[HeartRate] Computing BPM labels...")
-        bpm_labels = compute_bpm_labels(X_raw, fs=cfg.sampling_frequency)
-        train_ds_hr = ECGHeartRateDataset(X_std, bpm_labels, meta, split="train")
-        val_ds_hr = ECGHeartRateDataset(X_std, bpm_labels, meta, split="val")
-        train_loader_hr = DataLoader(
-            train_ds_hr,
-            batch_size=diff_cfg.hr_batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-        )
-        val_loader_hr = DataLoader(
-            val_ds_hr,
-            batch_size=diff_cfg.hr_batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-        )
-        hr_model = HeartRateRegressor(in_channels=C, embed_dim=diff_cfg.cdim)
-        if os.path.isfile(diff_cfg.hr_ckpt):
-            print(f"[HeartRate] Loading surrogate from {diff_cfg.hr_ckpt}")
-            state = torch.load(diff_cfg.hr_ckpt, map_location=diff_cfg.device)
-            hr_model.load_state_dict(state)
-            hr_metrics = {"train_mae": None, "val_mae": None}
-        else:
-            print("[HeartRate] Training surrogate regressor (BPM)...")
-            hr_metrics = train_heart_rate_regressor(hr_model, train_loader_hr, val_loader_hr, diff_cfg)
-            torch.save(hr_model.state_dict(), diff_cfg.hr_ckpt)
-            print(f"[HeartRate] Saved surrogate to {diff_cfg.hr_ckpt}")
-        utility_model = hr_model
+        print("[Diagnosis] Training diagnosis surrogate (multi-label)...")
+        diag_metrics = train_diagnosis_classifier(diag_model, train_loader_diag, val_loader_diag, diff_cfg)
+        torch.save(diag_model.state_dict(), diag_ckpt)
+        print(f"[Diagnosis] Saved surrogate to {diag_ckpt}")
+    diag_model.to(diff_cfg.device)
+    diag_metrics_raw = eval_diagnosis(diag_model, val_loader_diag, diff_cfg.device)
+    utility_model = diag_model
 
     # 6) PrivDiffuser training + anonymization
     X_std_anon, val_row_idx = train_and_apply_privdiffuser_ecg(
@@ -806,35 +779,34 @@ def main():
     id_metrics_anon = eval_identity(id_model, val_loader_id_anon, cfg)
 
     # Diagnosis evaluation on anonymized
-    if utility_kind == "diagnosis":
-        val_ds_diag_anon = DiagnosisDataset(X_std_anon, y_diag, meta, split="val")
-        val_loader_diag_anon = DataLoader(
-            val_ds_diag_anon,
-            batch_size=diff_cfg.hr_batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-        )
-        diag_metrics_anon = eval_diagnosis(utility_model, val_loader_diag_anon, diff_cfg.device)
+    val_ds_diag_anon = DiagnosisDataset(X_std_anon, y_diag, meta, split="val")
+    val_loader_diag_anon = DataLoader(
+        val_ds_diag_anon,
+        batch_size=diff_cfg.hr_batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+    diag_metrics_anon = eval_diagnosis(utility_model, val_loader_diag_anon, diff_cfg.device)
 
-        # Thresholded diagnosis metrics (aligned with Blinder)
-        def collect_probs(loader):
-            all_probs, all_labels = [], []
-            utility_model.eval()
-            with torch.no_grad():
-                for xb, yb in loader:
-                    xb = xb.to(diff_cfg.device)
-                    yb = yb.to(diff_cfg.device)
-                    logits, _ = utility_model(xb)
-                    probs = torch.sigmoid(logits).cpu().numpy()
-                    all_probs.append(probs)
-                    all_labels.append(yb.cpu().numpy())
-            return np.concatenate(all_probs, axis=0), np.concatenate(all_labels, axis=0)
+    # Thresholded diagnosis metrics (aligned with Blinder)
+    def collect_probs(loader):
+        all_probs, all_labels = [], []
+        utility_model.eval()
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb = xb.to(diff_cfg.device)
+                yb = yb.to(diff_cfg.device)
+                logits, _ = utility_model(xb)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                all_probs.append(probs)
+                all_labels.append(yb.cpu().numpy())
+        return np.concatenate(all_probs, axis=0), np.concatenate(all_labels, axis=0)
 
-        probs_raw, labels_raw = collect_probs(val_loader_diag)
-        probs_anon, labels_anon = collect_probs(val_loader_diag_anon)
-        diag_thresh_raw = compute_diag_metrics_thresholded(probs_raw, labels_raw, thresh=0.5)
-        diag_thresh_anon = compute_diag_metrics_thresholded(probs_anon, labels_anon, thresh=0.5)
+    probs_raw, labels_raw = collect_probs(val_loader_diag)
+    probs_anon, labels_anon = collect_probs(val_loader_diag_anon)
+    diag_thresh_raw = compute_diag_metrics_thresholded(probs_raw, labels_raw, thresh=0.5)
+    diag_thresh_anon = compute_diag_metrics_thresholded(probs_anon, labels_anon, thresh=0.5)
 
     # 8) Fidelity metrics (raw vs anonymized on val subset)
     print("[Fidelity] Computing RMSE and PSD correlation (raw vs anonymized)...")
@@ -885,7 +857,16 @@ def main():
                 max_seconds=5.0,
             )
 
-    # 10) Save metrics
+    # 10) BPM utility (direct measurement)
+    bpm_raw = compute_bpm_labels(X_val_raw, fs=cfg.sampling_frequency)
+    bpm_anon = compute_bpm_labels(X_val_anon_raw, fs=cfg.sampling_frequency)
+    bpm_metrics = {
+        "bpm_raw_mean": float(np.mean(bpm_raw)),
+        "bpm_anon_mean": float(np.mean(bpm_anon)),
+        "bpm_mae": float(np.mean(np.abs(bpm_raw - bpm_anon))),
+    }
+
+    # 11) Save metrics
     results = {
         "utility_target": utility_kind,
         "diagnosis_surrogate_train": diag_metrics,
@@ -893,7 +874,7 @@ def main():
         "diagnosis_privdiffuser": diag_metrics_anon,
         "diagnosis_baseline_threshold": diag_thresh_raw,
         "diagnosis_privdiffuser_threshold": diag_thresh_anon,
-        "heart_rate_surrogate": hr_metrics,
+        "bpm_direct": bpm_metrics,
         "identity_baseline": id_metrics_base,
         "identity_privdiffuser": id_metrics_anon,
         "fidelity_privdiffuser": fidelity_anon,

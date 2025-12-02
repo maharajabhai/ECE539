@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import pickle
+import gc
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -32,7 +33,7 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 from scipy import signal
 import matplotlib.pyplot as plt
 from ecg_priv_common import compute_diag_metrics_thresholded
-from ecg_priv_models import DiagnosisClassifier
+from ecg_priv_models import DiagnosisClassifier, compute_bpm_labels
 from ptbxl_loader import load_ptbxl
 
 # -------------------------------------------------------------------
@@ -72,7 +73,7 @@ class Config:
     sampling_frequency: int = 500  # Hz
 
     # identity classifier
-    identity_batch_size: int = 64
+    identity_batch_size: int = 32
     identity_lr: float = 1e-3
     identity_epochs: int = 200
     min_samples_per_patient: int = 5
@@ -82,8 +83,11 @@ class Config:
     use_blinder: bool = True
     blinder_z_dim: int = 64
     blinder_epochs: int = 200
-    blinder_batch_size: int = 128
+    blinder_batch_size: int = 2
     blinder_lr: float = 1e-3
+
+    # utility surrogate evaluation
+    utility_eval_batch_size: int = 32
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -379,53 +383,57 @@ def train_or_load_utility_model_from_ptbxl(
     cfg: Config,
 ):
     print("[Utility] Preparing standardization...")
-    scaler_dir = os.path.join(cfg.outputfolder, cfg.experiment, "data")
-    os.makedirs(scaler_dir, exist_ok=True)
-    standard_scaler_path = os.path.join(scaler_dir, "standard_scaler.pkl")
-
-    if os.path.exists(standard_scaler_path):
-        print(f"[Utility] Loading StandardScaler from {standard_scaler_path}")
-        standard_scaler = pickle.load(open(standard_scaler_path, "rb"))
-    else:
-        print("[Utility] Fitting new StandardScaler on folds 1–9...")
-        train_mask = Y_db["strat_fold"] < 10
-        X_train_flat = X[train_mask].reshape(train_mask.sum(), -1)
-        standard_scaler = StandardScaler()
-        standard_scaler.fit(X_train_flat)
-        utils.save_pickle(standard_scaler_path, standard_scaler)
-        print(f"[Utility] Saved scaler to {standard_scaler_path}")
-
-    X_std = utils.apply_standardizer(X, standard_scaler)
-
-    train_mask = Y_db["strat_fold"] < 10
-    val_mask = Y_db["strat_fold"] == 10
-
-    X_train = X_std[train_mask]
-    y_train = y_util[train_mask]
-    X_val = X_std[val_mask]
-    y_val = y_util[val_mask]
-
-    num_classes = y_train.shape[1]
-    C = X_train.shape[2]
-
-    # Load simple diagnosis surrogate if available; else warn and return zeros.
     util_dir = os.path.join(PROJECT_ROOT, "models", "ecg_privdiffuser")
+    scaler_path = os.path.join(util_dir, "util_scaler.pkl")
+    if os.path.exists(scaler_path):
+        print(f"[Utility] Loading StandardScaler from {scaler_path}")
+        standard_scaler = pickle.load(open(scaler_path, "rb"))
+    else:
+        print("[Utility] Fitting StandardScaler on full dataset...")
+        X_flat = X.reshape(len(X), -1)
+        standard_scaler = StandardScaler(copy=False)
+        standard_scaler.fit(X_flat)
+        os.makedirs(util_dir, exist_ok=True)
+        pickle.dump(standard_scaler, open(scaler_path, "wb"))
+        print(f"[Utility] Saved scaler to {scaler_path}")
+
+    # Apply scaler directly (flatten then reshape)
+    X_flat = X.reshape(len(X), -1)
+    X_std = standard_scaler.transform(X_flat).reshape(X.shape).astype(np.float32, copy=False)
+    del X_flat
+    gc.collect()
+
+    # Use full dataset for utility metrics (no strat_fold needed)
+    num_classes = y_util.shape[1]
+    C = X_std.shape[2]
+
     diag_ckpt = os.path.join(util_dir, "diag_surrogate.pt")
-    model = DiagnosisClassifier(in_channels=C, n_classes=num_classes, embed_dim=64)
+    model = DiagnosisClassifier(in_channels=C, n_classes=num_classes, embed_dim=96).to(cfg.device)
     if os.path.isfile(diag_ckpt):
         print(f"[Utility] Loading diagnosis surrogate from {diag_ckpt}")
         state = torch.load(diag_ckpt, map_location=cfg.device)
         model.load_state_dict(state)
         model.eval()
+        # Batched inference to avoid GPU OOM
+        eval_ds = TensorDataset(torch.tensor(np.transpose(X_std, (0, 2, 1))).float())
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=cfg.utility_eval_batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+        all_probs = []
         with torch.no_grad():
-            xb = torch.tensor(np.transpose(X_val, (0, 2, 1))).float().to(cfg.device)
-            logits, _ = model(xb)
-            probs = torch.sigmoid(logits).cpu().numpy()
+            for (xb,) in eval_loader:
+                xb = xb.to(cfg.device)
+                logits, _ = model(xb)
+                all_probs.append(torch.sigmoid(logits).cpu().numpy())
+        probs = np.concatenate(all_probs, axis=0)
     else:
         print("[Utility] Missing diag_surrogate.pt; please run train_ecg_utils.py. Using zeros for metrics.")
-        probs = np.zeros_like(y_val, dtype=np.float32)
+        probs = np.zeros_like(y_util, dtype=np.float32)
 
-    y_true = y_val.astype(np.float32)
+    y_true = y_util.astype(np.float32)
     metrics_basic = compute_diag_metrics_thresholded(probs, y_true, thresh=0.5)
     metrics = {
         "utility_sample_acc": metrics_basic["sample_acc"],
@@ -434,7 +442,7 @@ def train_or_load_utility_model_from_ptbxl(
         "utility_macro_f1": metrics_basic["macro_f1"],
         "utility_macro_acc": metrics_basic["macro_acc"],
     }
-    print("[Utility] Validation metrics:")
+    print("[Utility] Metrics on full set:")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}")
 
@@ -446,8 +454,9 @@ def eval_utility_on_data(model, X_val_std: np.ndarray, y_val: np.ndarray) -> Dic
         probs = np.zeros_like(y_val, dtype=np.float32)
     else:
         model.eval()
+        device = next(model.parameters()).device
         with torch.no_grad():
-            xb = torch.tensor(np.transpose(X_val_std, (0, 2, 1))).float()
+            xb = torch.tensor(np.transpose(X_val_std, (0, 2, 1))).float().to(device)
             logits, _ = model(xb)
             probs = torch.sigmoid(logits).cpu().numpy()
 
@@ -700,9 +709,13 @@ def load_or_train_blinder_vae(X_std: np.ndarray, cfg: Config) -> ECGBlinderVAE:
     model = ECGBlinderVAE(T=T, C=C, z_dim=cfg.blinder_z_dim).to(cfg.device)
     if os.path.exists(cfg.blinder_ckpt):
         print(f"[BlinderVAE] Loading existing checkpoint from {cfg.blinder_ckpt}")
-        state = torch.load(cfg.blinder_ckpt, map_location=cfg.device)
-        model.load_state_dict(state)
-        return model
+        try:
+            state = torch.load(cfg.blinder_ckpt, map_location=cfg.device)
+            model.load_state_dict(state)
+            return model
+        except RuntimeError as e:
+            print(f"[BlinderVAE] Checkpoint mismatch ({e}); retraining...")
+            return train_blinder_vae(X_std, cfg)
     else:
         return train_blinder_vae(X_std, cfg)
 
@@ -737,6 +750,8 @@ def main():
 
     # 1) Load PTB-XL
     X, Y = load_ptbxl(PROJECT_ROOT, cfg.datafolder, cfg.sampling_frequency)
+    # Keep in float32 to cut RAM in half
+    X = X.astype(np.float32, copy=False)
 
     # 2) Utility labels
     print("Building utility labels...")
@@ -753,6 +768,11 @@ def main():
     # 5) Identity datasets/loaders
     train_ds = IdentityDataset(data_std, meta, split="train")
     val_ds = IdentityDataset(data_std, meta, split="val")
+    # Keep a small copy of raw validation subset, then drop full raw array to save RAM
+    val_row_idx = val_ds.meta["row_idx"].values
+    X_val_raw = X[val_row_idx].astype(np.float32, copy=False)
+    del X
+    gc.collect()
 
     train_loader = DataLoader(
         train_ds,
@@ -790,8 +810,6 @@ def main():
 
     # 7) Baseline fidelity (identity)
     print("[Fidelity] Baseline (identity) on validation subset...")
-    val_row_idx = val_ds.meta["row_idx"].values
-    X_val_raw = X[val_row_idx]
     X_val_anon_raw_base = X_val_raw
 
     rmses_base, psd_corrs_base = [], []
@@ -800,6 +818,12 @@ def main():
         psd_corrs_base.append(psd_correlation(X_val_raw[i],
                                               X_val_anon_raw_base[i],
                                               fs=cfg.sampling_frequency))
+    # BPM utility on baseline
+    bpm_raw = compute_bpm_labels(X_val_raw, fs=cfg.sampling_frequency)
+    bpm_base_metrics = {
+        "bpm_raw_mean": float(np.mean(bpm_raw)),
+        "bpm_mae": 0.0,  # baseline vs itself
+    }
     fidelity_baseline = {
         "rmse_mean": float(np.mean(rmses_base)),
         "rmse_std": float(np.std(rmses_base)),
@@ -854,13 +878,10 @@ def main():
         print("[Identity] Evaluating on anonymized validation set...")
         id_val_metrics_anon = eval_identity(model_id, val_loader_anon, cfg)
 
-        # Utility on anonymized ECG (fold 10)
-        val_mask = Y["strat_fold"] == 10
-        X_val_std_anon = data_std_anon[val_mask]
-        y_val = y_util[val_mask]
+        # Utility on anonymized ECG (full set to match baseline)
         util_val_metrics_anon = eval_utility_on_data(util_model,
-                                                     X_val_std_anon,
-                                                     y_val)
+                                                     data_std_anon,
+                                                     y_util)
 
         # Fidelity between raw and anonymized (val subset)
         print("[Fidelity] Blinder-style anonymization on validation subset...")
@@ -876,6 +897,13 @@ def main():
                 psd_correlation(X_val_raw[i], X_val_anon_raw[i],
                                 fs=cfg.sampling_frequency)
             )
+        # BPM utility on anonymized
+        bpm_anon = compute_bpm_labels(X_val_anon_raw, fs=cfg.sampling_frequency)
+        bpm_blinder_metrics = {
+            "bpm_raw_mean": float(np.mean(bpm_raw)),
+            "bpm_anon_mean": float(np.mean(bpm_anon)),
+            "bpm_mae": float(np.mean(np.abs(bpm_raw - bpm_anon))),
+        }
 
         fidelity_blinder = {
             "rmse_mean": float(np.mean(rmses_blinder)),
@@ -949,6 +977,8 @@ def main():
         "identity_val_metrics_blinder": id_val_metrics_anon,
         "utility_val_metrics_baseline": util_val_metrics,
         "utility_val_metrics_blinder": util_val_metrics_anon,
+        "bpm_baseline": bpm_base_metrics,
+        "bpm_blinder": bpm_blinder_metrics if cfg.use_blinder else None,
         "fidelity_baseline": fidelity_baseline,
         "fidelity_blinder": fidelity_blinder,
         "plots": {
