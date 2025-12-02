@@ -1,0 +1,29 @@
+{
+  "identity_baseline": {
+    "subject_acc": 0.8183076797784836,
+    "subject_f1": 0.8179756217093247
+  },
+  "identity_privdiffuser": {
+    "subject_acc": 0.0009772782799902272,
+    "subject_f1": 0.001017384485733623
+  },
+  "utility_baseline": {
+    "gesture_acc": 0.8285691017183809,
+    "gesture_f1": 0.7541566680216301
+  },
+  "utility_privdiffuser": {
+    "gesture_acc": 0.2008306865379917,
+    "gesture_f1": 0.034342224048256376
+  },
+  "fidelity_privdiffuser": {
+    "rmse_mean": 0.5869236230555631,
+    "rmse_std": 0.7524374752062053,
+    "psd_corr_mean": 0.3459331277856764,
+    "psd_corr_std": 0.4214431093806408
+  },
+  "plots": {
+    "fft_raw": "/home/simran/ECE539/emg_privacy_outputs/emg_fft_val_raw.png",
+    "fft_anon": "/home/simran/ECE539/emg_privacy_outputs/emg_fft_val_privdiffuser.png",
+    "overlay_dir": "/home/simran/ECE539/emg_privacy_outputs/emg_overlay_privdiffuser"
+  }
+}

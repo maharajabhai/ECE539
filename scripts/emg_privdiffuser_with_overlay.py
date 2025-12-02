@@ -167,10 +167,14 @@ class IdentityWrapper(nn.Module):
         if x.dim() == 4:
             x = x.squeeze(1)
         out = self.base(x)
-        # base returns dict with 'logits'; cond_fn expects logits tensor
-        if isinstance(out, dict) and "logits" in out:
-            return out["logits"]
-        return out
+        # base returns dict with logits/feat
+        if isinstance(out, dict):
+            logits = out.get("logits", out)
+            feat = out.get("feat", None)
+            return logits, feat
+        if isinstance(out, tuple) and len(out) == 2:
+            return out
+        return out, None
 
 
 # -------------------------------------------------------------------------

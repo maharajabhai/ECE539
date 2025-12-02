@@ -7,10 +7,8 @@
 #SBATCH --job-name="ECG_UTILS"
 #SBATCH --gres=gpu:1
 
-set -e
-
-cd "$(dirname "$0")/.."
-module purge || true
+cd /home/simran/ECE539
+export PYTHONPATH="$PWD/ecg_ptbxl_benchmarking/code:$PYTHONPATH"
 
 echo "Starting ECG utility training (diagnosis/BPM)..."
 python3 scripts/train_ecg_utils.py

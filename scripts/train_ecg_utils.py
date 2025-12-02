@@ -8,6 +8,7 @@ Designed to run once on a small GPU (V100/A100) and be reused by Blinder/PrivDif
 import os
 import sys
 import json
+import importlib.util
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -25,21 +26,22 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 if TOP_LEVEL not in sys.path:
     sys.path.insert(0, TOP_LEVEL)
-
-from pipeline.datasets import ecg_ptbxl
+from ptbxl_loader import load_ptbxl
 from ecg_blinder_pipeline_with_overlay import (
     Config as ECGConfig,
     build_identity_meta,
     build_utility_labels_from_superclass,
 )
-from ecg_privdiffuser_with_overlay import (
+from ecg_priv_models import (
     DiagnosisDataset,
     DiagnosisClassifier,
-    train_diagnosis_classifier,
-    eval_diagnosis,
-    compute_bpm_labels,
     ECGHeartRateDataset,
     HeartRateRegressor,
+    compute_bpm_labels,
+)
+from ecg_privdiffuser_with_overlay import (
+    train_diagnosis_classifier,
+    eval_diagnosis,
     train_heart_rate_regressor,
 )
 from ecg_priv_common import compute_diag_metrics_thresholded
@@ -48,6 +50,7 @@ from ecg_priv_common import compute_diag_metrics_thresholded
 @dataclass
 class UtilTrainConfig:
     model_dir: str = os.path.join(PROJECT_ROOT, "models", "ecg_privdiffuser")
+    scaler_path: str = os.path.join(PROJECT_ROOT, "models", "ecg_privdiffuser", "util_scaler.pkl")
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     hr_batch_size: int = 128
     hr_lr: float = 1e-3
@@ -61,17 +64,12 @@ class UtilTrainConfig:
 def main():
     cfg = ECGConfig()
     util_cfg = UtilTrainConfig()
+    # Use all patients (no min_samples filtering)
+    cfg.min_samples_per_patient = 1
     os.makedirs(util_cfg.model_dir, exist_ok=True)
 
-    # 1) Load PTB-XL
-    data_dict = ecg_ptbxl.load_ptbxl_and_eda(
-        ptbxl_root=cfg.datafolder,
-        sampling_rate=cfg.sampling_frequency,
-        output_dir=os.path.join(cfg.results_dir, "ptbxl_eda"),
-        save_csv=False,
-    )
-    X_raw = data_dict["X"]   # (N, T, C)
-    Y = data_dict["Y"]
+    # 1) Load PTB-XL via local loader
+    X_raw, Y = load_ptbxl(PROJECT_ROOT, cfg.datafolder, cfg.sampling_frequency)
     print(f"[Data] ECG shape: {X_raw.shape}")
 
     # 2) Identity split (for consistent folds)
@@ -83,6 +81,11 @@ def main():
     train_idx = meta[meta["id_fold"] == 0]["row_idx"].values
     X_train_flat = X_raw[train_idx].reshape(len(train_idx), -1)
     scaler.fit(X_train_flat)
+    # save scaler for reuse by blinder/privdiffuser
+    os.makedirs(util_cfg.model_dir, exist_ok=True)
+    with open(util_cfg.scaler_path, "wb") as f:
+        import pickle
+        pickle.dump(scaler, f)
     X_std = scaler.transform(X_raw.reshape(N, -1)).reshape(N, T, C)
 
     results = {}
@@ -109,16 +112,10 @@ def main():
 
     diag_model = DiagnosisClassifier(in_channels=C, n_classes=y_diag.shape[1], embed_dim=util_cfg.cdim)
     diag_ckpt = os.path.join(util_cfg.model_dir, "diag_surrogate.pt")
-    if os.path.isfile(diag_ckpt):
-        print(f"[Diagnosis] Found checkpoint at {diag_ckpt}, skipping training.")
-        state = torch.load(diag_ckpt, map_location=util_cfg.device)
-        diag_model.load_state_dict(state)
-        diag_metrics_train = {"train_bce": None, "val_bce": None, "val_auroc_macro": None}
-    else:
-        print("[Diagnosis] Training surrogate...")
-        diag_metrics_train = train_diagnosis_classifier(diag_model, train_loader_diag, val_loader_diag, util_cfg)
-        torch.save(diag_model.state_dict(), diag_ckpt)
-        print(f"[Diagnosis] Saved to {diag_ckpt}")
+    print("[Diagnosis] Training surrogate (overwrite checkpoint)...")
+    diag_metrics_train = train_diagnosis_classifier(diag_model, train_loader_diag, val_loader_diag, util_cfg)
+    torch.save(diag_model.state_dict(), diag_ckpt)
+    print(f"[Diagnosis] Saved to {diag_ckpt}")
     diag_model.to(util_cfg.device)
     diag_metrics_val = eval_diagnosis(diag_model, val_loader_diag, util_cfg.device)
     # Thresholded metrics
@@ -140,48 +137,46 @@ def main():
     results["diagnosis_train"] = diag_metrics_train
     results["diagnosis_val"] = diag_metrics_val
     results["diagnosis_val_threshold"] = diag_thresh
+    results["scaler_path"] = util_cfg.scaler_path
 
     # ---------------- Optional: Heart-rate surrogate ----------------
     hr_ckpt = os.path.join(util_cfg.model_dir, "hr_surrogate.pt")
     hr_metrics_train = hr_metrics_val = None
-    if not os.path.isfile(hr_ckpt):
-        print("[HeartRate] Computing BPM labels...")
-        bpm_labels = compute_bpm_labels(X_raw, fs=cfg.sampling_frequency)
-        train_ds_hr = ECGHeartRateDataset(X_std, bpm_labels, meta, split="train")
-        val_ds_hr = ECGHeartRateDataset(X_std, bpm_labels, meta, split="val")
-        train_loader_hr = DataLoader(
-            train_ds_hr,
-            batch_size=util_cfg.hr_batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-        )
-        val_loader_hr = DataLoader(
-            val_ds_hr,
-            batch_size=util_cfg.hr_batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-        )
-        hr_model = HeartRateRegressor(in_channels=C, embed_dim=util_cfg.cdim)
-        hr_metrics_train = train_heart_rate_regressor(hr_model, train_loader_hr, val_loader_hr, util_cfg)
-        torch.save(hr_model.state_dict(), hr_ckpt)
-        print(f"[HeartRate] Saved to {hr_ckpt}")
-        # Evaluate val MAE
-        hr_model.to(util_cfg.device)
-        hr_model.eval()
-        maes = []
-        with torch.no_grad():
-            for xb, yb in val_loader_hr:
-                xb = xb.to(util_cfg.device)
-                yb = yb.to(util_cfg.device)
-                preds, _ = hr_model(xb)
-                maes.append(torch.abs(preds - yb).cpu().numpy())
-        hr_metrics_val = {"val_mae": float(np.mean(np.concatenate(maes)))}
-        results["heart_rate_train"] = hr_metrics_train
-        results["heart_rate_val"] = hr_metrics_val
-    else:
-        print(f"[HeartRate] Found checkpoint at {hr_ckpt}, skipping HR training.")
+    print("[HeartRate] Computing BPM labels...")
+    bpm_labels = compute_bpm_labels(X_raw, fs=cfg.sampling_frequency)
+    train_ds_hr = ECGHeartRateDataset(X_std, bpm_labels, meta, split="train")
+    val_ds_hr = ECGHeartRateDataset(X_std, bpm_labels, meta, split="val")
+    train_loader_hr = DataLoader(
+        train_ds_hr,
+        batch_size=util_cfg.hr_batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+    val_loader_hr = DataLoader(
+        val_ds_hr,
+        batch_size=util_cfg.hr_batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+    hr_model = HeartRateRegressor(in_channels=C, embed_dim=util_cfg.cdim)
+    hr_metrics_train = train_heart_rate_regressor(hr_model, train_loader_hr, val_loader_hr, util_cfg)
+    torch.save(hr_model.state_dict(), hr_ckpt)
+    print(f"[HeartRate] Saved to {hr_ckpt}")
+    # Evaluate val MAE
+    hr_model.to(util_cfg.device)
+    hr_model.eval()
+    maes = []
+    with torch.no_grad():
+        for xb, yb in val_loader_hr:
+            xb = xb.to(util_cfg.device)
+            yb = yb.to(util_cfg.device)
+            preds, _ = hr_model(xb)
+            maes.append(torch.abs(preds - yb).cpu().numpy())
+    hr_metrics_val = {"val_mae": float(np.mean(np.concatenate(maes)))}
+    results["heart_rate_train"] = hr_metrics_train
+    results["heart_rate_val"] = hr_metrics_val
 
     # ------------- Save metrics summary -----------------
     out_json = os.path.join(util_cfg.model_dir, "ecg_util_metrics.json")

@@ -32,6 +32,8 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 from scipy import signal
 import matplotlib.pyplot as plt
 from ecg_priv_common import compute_diag_metrics_thresholded
+from ecg_priv_models import DiagnosisClassifier
+from ptbxl_loader import load_ptbxl
 
 # -------------------------------------------------------------------
 # Path setup
@@ -45,12 +47,8 @@ for p in [PROJECT_ROOT, PTBXL_BENCH_CODE]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# ecg_ptbxl_benchmarking imports
+# ecg_ptbxl_benchmarking imports (utils only)
 from utils import utils
-from models.fastai_model import fastai_model
-
-# your dataset loader
-from pipeline.datasets import ecg_ptbxl
 
 
 # -------------------------------------------------------------------
@@ -59,11 +57,7 @@ from pipeline.datasets import ecg_ptbxl
 
 @dataclass
 class Config:
-    datafolder: str = os.path.join(
-        PROJECT_ROOT,
-        "data",
-        "ptb-xl-a-large-publicly-available-electrocardiography-dataset-1",
-    )
+    datafolder: str = os.path.join(PROJECT_ROOT, "data")
 
     outputfolder: str = os.path.join(
         PROJECT_ROOT,
@@ -75,7 +69,7 @@ class Config:
     modelname: str = "fastai_xresnet1d101"
     n_classes_pretrained: int = 71
 
-    sampling_frequency: int = 100  # Hz
+    sampling_frequency: int = 500  # Hz
 
     # identity classifier
     identity_batch_size: int = 64
@@ -151,8 +145,12 @@ def build_identity_meta(Y: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dic
     meta["row_idx"] = np.arange(len(meta))
 
     counts = meta["patient_id"].value_counts()
-    valid_pids = counts[counts >= cfg.min_samples_per_patient].index
-    meta = meta[meta["patient_id"].isin(valid_pids)].reset_index(drop=True)
+    if cfg.min_samples_per_patient and cfg.min_samples_per_patient > 1:
+        valid_pids = counts[counts >= cfg.min_samples_per_patient].index
+        meta = meta[meta["patient_id"].isin(valid_pids)].reset_index(drop=True)
+    else:
+        valid_pids = counts.index
+        meta = meta.reset_index(drop=True)
 
     print(f"[Identity] After min_samples filter: {len(meta)} records "
           f"from {len(valid_pids)} patients")
@@ -408,39 +406,30 @@ def train_or_load_utility_model_from_ptbxl(
     y_val = y_util[val_mask]
 
     num_classes = y_train.shape[1]
-    T, C = X_train.shape[1], X_train.shape[2]
-    input_shape = [T, C]
+    C = X_train.shape[2]
 
-    pretrainedfolder = os.path.join(
-        cfg.outputfolder,
-        cfg.experiment,
-        "models",
-        cfg.modelname,
-    )
+    # Load simple diagnosis surrogate if available; else warn and return zeros.
+    util_dir = os.path.join(PROJECT_ROOT, "models", "ecg_privdiffuser")
+    diag_ckpt = os.path.join(util_dir, "diag_surrogate.pt")
+    model = DiagnosisClassifier(in_channels=C, n_classes=num_classes, embed_dim=64)
+    if os.path.isfile(diag_ckpt):
+        print(f"[Utility] Loading diagnosis surrogate from {diag_ckpt}")
+        state = torch.load(diag_ckpt, map_location=cfg.device)
+        model.load_state_dict(state)
+        model.eval()
+        with torch.no_grad():
+            xb = torch.tensor(np.transpose(X_val, (0, 2, 1))).float().to(cfg.device)
+            logits, _ = model(xb)
+            probs = torch.sigmoid(logits).cpu().numpy()
+    else:
+        print("[Utility] Missing diag_surrogate.pt; please run train_ecg_utils.py. Using zeros for metrics.")
+        probs = np.zeros_like(y_val, dtype=np.float32)
 
-    print("[Utility] Building fastai model...")
-    model = fastai_model(
-        cfg.modelname,
-        num_classes,
-        cfg.sampling_frequency,
-        cfg.outputfolder,
-        input_shape=input_shape,
-        pretrainedfolder=pretrainedfolder,
-        n_classes_pretrained=cfg.n_classes_pretrained,
-        pretrained=True,
-        epochs_finetuning=0,
-    )
-
-    print("[Utility] Evaluating on validation set (fold 10)...")
-    y_val_pred = model.predict(X_val)
-    utils.evaluate_experiment(y_val, y_val_pred)
-
-    probs = y_val_pred
     y_true = y_val.astype(np.float32)
     metrics_basic = compute_diag_metrics_thresholded(probs, y_true, thresh=0.5)
     metrics = {
         "utility_sample_acc": metrics_basic["sample_acc"],
-        "utility_f1": metrics_basic["macro_f1"],  # keep legacy key for F1
+        "utility_f1": metrics_basic["macro_f1"],
         "utility_mae": metrics_basic["mae"],
         "utility_macro_f1": metrics_basic["macro_f1"],
         "utility_macro_acc": metrics_basic["macro_acc"],
@@ -453,10 +442,16 @@ def train_or_load_utility_model_from_ptbxl(
 
 
 def eval_utility_on_data(model, X_val_std: np.ndarray, y_val: np.ndarray) -> Dict[str, float]:
-    probs = model.predict(X_val_std)
-    probs = np.nan_to_num(probs, nan=0.0, posinf=5.0, neginf=-5.0)
+    if model is None:
+        probs = np.zeros_like(y_val, dtype=np.float32)
+    else:
+        model.eval()
+        with torch.no_grad():
+            xb = torch.tensor(np.transpose(X_val_std, (0, 2, 1))).float()
+            logits, _ = model(xb)
+            probs = torch.sigmoid(logits).cpu().numpy()
 
-    metrics_basic = compute_diag_metrics_thresholded(probs, y_true, thresh=0.5)
+    metrics_basic = compute_diag_metrics_thresholded(probs, y_val.astype(np.float32), thresh=0.5)
     metrics = {
         "utility_sample_acc": metrics_basic["sample_acc"],
         "utility_f1": metrics_basic["macro_f1"],
@@ -741,14 +736,7 @@ def main():
     print("=== ECG Privacy + Blinder-style Pipeline (with overlay plots) ===")
 
     # 1) Load PTB-XL
-    data_dict = ecg_ptbxl.load_ptbxl_and_eda(
-        ptbxl_root=cfg.datafolder,
-        sampling_rate=cfg.sampling_frequency,
-        output_dir=os.path.join(cfg.results_dir, "ptbxl_eda"),
-        save_csv=False,
-    )
-    X = data_dict["X"]   # (N, T, C=12)
-    Y = data_dict["Y"]
+    X, Y = load_ptbxl(PROJECT_ROOT, cfg.datafolder, cfg.sampling_frequency)
 
     # 2) Utility labels
     print("Building utility labels...")

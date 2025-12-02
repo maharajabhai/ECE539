@@ -1,0 +1,18 @@
+{
+  "diagnosis_train": {
+    "train_bce": null,
+    "val_bce": null,
+    "val_auroc_macro": null
+  },
+  "diagnosis_val": {
+    "val_bce": 0.5619755387306213,
+    "val_auroc_macro": 0.7374827247517226
+  },
+  "diagnosis_val_threshold": {
+    "sample_acc": 0.3125,
+    "macro_f1": 0.40599219620958743,
+    "macro_acc": 0.7437499999999999,
+    "mae": 0.40523219108581543
+  },
+  "scaler_path": "/home/simran/ECE539/models/ecg_privdiffuser/util_scaler.pkl"
+}
