@@ -26,16 +26,24 @@
   "utility_val_metrics_baseline": {
     "utility_sample_acc": 0.7031643540779411,
     "utility_f1": 0.7369931941088489,
-    "utility_mae": 0.1381690353155136,
+    "utility_mae": 0.13817152380943298,
     "utility_macro_f1": 0.7369931941088489,
-    "utility_macro_acc": 0.9101066996382287
+    "utility_macro_acc": 0.9101066996382287,
+    "utility_auc_macro": 0.9468790505586308,
+    "utility_auc_micro": 0.9475454806494682,
+    "utility_ap_macro": 0.8541483683065849,
+    "utility_ap_micro": 0.8653964996538607
   },
   "utility_val_metrics_blinder": {
-    "utility_sample_acc": 0.14965425653707012,
-    "utility_f1": 0.2565282856261319,
-    "utility_mae": 0.43306198716163635,
-    "utility_macro_f1": 0.2565282856261319,
-    "utility_macro_acc": 0.6016394193341577
+    "utility_sample_acc": 0.14951687502862115,
+    "utility_f1": 0.25647301466930017,
+    "utility_mae": 0.43310004472732544,
+    "utility_macro_f1": 0.25647301466930017,
+    "utility_macro_acc": 0.6015134862847461,
+    "utility_auc_macro": 0.5114964411143959,
+    "utility_auc_micro": 0.5725165204840705,
+    "utility_ap_macro": 0.22720262757261167,
+    "utility_ap_micro": 0.259257944520188
   },
   "bpm_baseline": {
     "bpm_raw_mean": 114.2542953491211,
@@ -53,10 +61,10 @@
     "psd_corr_std": 7.114816849911458e-08
   },
   "fidelity_blinder": {
-    "rmse_mean": 0.21216446310281753,
-    "rmse_std": 0.0886723955712349,
-    "psd_corr_mean": 0.7706083627737825,
-    "psd_corr_std": 0.33514907974679736
+    "rmse_mean": 0.2121644644998014,
+    "rmse_std": 0.08867239561535517,
+    "psd_corr_mean": 0.7706083879835205,
+    "psd_corr_std": 0.33514906305892794
   },
   "plots": {
     "fft_val_raw_baseline": "/home/simran/ECE539/privacy_baseline_outputs/fft_val_raw_baseline.png",

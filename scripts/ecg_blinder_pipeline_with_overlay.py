@@ -441,6 +441,10 @@ def train_or_load_utility_model_from_ptbxl(
         "utility_mae": metrics_basic["mae"],
         "utility_macro_f1": metrics_basic["macro_f1"],
         "utility_macro_acc": metrics_basic["macro_acc"],
+        "utility_auc_macro": metrics_basic.get("auc_macro"),
+        "utility_auc_micro": metrics_basic.get("auc_micro"),
+        "utility_ap_macro": metrics_basic.get("ap_macro"),
+        "utility_ap_micro": metrics_basic.get("ap_micro"),
     }
     print("[Utility] Metrics on full set:")
     for k, v in metrics.items():
@@ -467,6 +471,10 @@ def eval_utility_on_data(model, X_val_std: np.ndarray, y_val: np.ndarray) -> Dic
         "utility_mae": metrics_basic["mae"],
         "utility_macro_f1": metrics_basic["macro_f1"],
         "utility_macro_acc": metrics_basic["macro_acc"],
+        "utility_auc_macro": metrics_basic.get("auc_macro"),
+        "utility_auc_micro": metrics_basic.get("auc_micro"),
+        "utility_ap_macro": metrics_basic.get("ap_macro"),
+        "utility_ap_micro": metrics_basic.get("ap_micro"),
     }
     print("[Utility|Anon] Validation metrics on anonymized data:")
     for k, v in metrics.items():
@@ -713,9 +721,9 @@ def load_or_train_blinder_vae(X_std: np.ndarray, cfg: Config) -> ECGBlinderVAE:
             state = torch.load(cfg.blinder_ckpt, map_location=cfg.device)
             model.load_state_dict(state)
             return model
-        except RuntimeError as e:
-            print(f"[BlinderVAE] Checkpoint mismatch ({e}); retraining...")
-            return train_blinder_vae(X_std, cfg)
+        except (RuntimeError, pickle.UnpicklingError, EOFError) as e:
+            print(f"[BlinderVAE] Checkpoint invalid/mismatch ({e}); skipping retrain. Please restore valid checkpoint.")
+            raise
     else:
         return train_blinder_vae(X_std, cfg)
 
